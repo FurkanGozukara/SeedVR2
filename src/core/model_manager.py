@@ -315,13 +315,23 @@ def configure_dit_model_inference(runner, device, checkpoint, config, preserve_v
     print(f"🚀 Loading model_weight: {model_weight}")
 
     t = time.time()
-    state_loading_device = "cpu" if "7b" in model_weight and vram_info['total_gb'] < 25 else device
+    # Always load state to CPU when preserve_vram is enabled to prevent spike
+    state_loading_device = "cpu" if preserve_vram or ("7b" in model_weight and vram_info['total_gb'] < 25) else device
     state = load_quantized_state_dict(checkpoint, state_loading_device, keep_native_fp8=True)
 
     if debug:
         print(f"🔄 CONFIG DIT : DiT load state dict time: {time.time() - t} seconds")
     t = time.time()
+    
+    # Ensure model is on same device as state dict to prevent temporary spike
+    if state_loading_device != loading_device:
+        runner.dit = runner.dit.to(state_loading_device)
+    
     runner.dit.load_state_dict(state, strict=True, assign=True)
+    
+    # Move back to original device if needed
+    if state_loading_device != loading_device and preserve_vram:
+        runner.dit = runner.dit.to(loading_device)
 
     if 'state' in locals():
         del state
@@ -339,6 +349,10 @@ def configure_dit_model_inference(runner, device, checkpoint, config, preserve_v
         runner.dit = FP8CompatibleDiT(runner.dit, skip_conversion=False)
     if debug:
         print(f"🔄 CONFIG DIT : FP8CompatibleDiT time: {time.time() - t} seconds")
+    
+    # Clear any temporary allocations from wrapping
+    if preserve_vram:
+        torch.cuda.empty_cache()
 
     # Move DiT to CPU to prevent VRAM leaks (especially for 3B model with complex RoPE)
     if preserve_vram and not blockswap_active:
