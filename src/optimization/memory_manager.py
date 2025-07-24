@@ -12,7 +12,25 @@ import time
 from typing import Tuple, Optional
 from src.common.cache import Cache
 from src.models.dit_v2.rope import RotaryEmbeddingBase
-from comfy import model_management as mm
+
+# Optional ComfyUI import with fallback
+try:
+    from comfy import model_management as mm
+    COMFYUI_AVAILABLE = True
+except ImportError:
+    # Fallback when ComfyUI is not available
+    class FallbackModelManagement:
+        @staticmethod
+        def unet_offload_device():
+            return "cpu"
+        
+        @staticmethod
+        def soft_empty_cache():
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+    
+    mm = FallbackModelManagement()
+    COMFYUI_AVAILABLE = False
 
 def get_basic_vram_info():
     """🔍 Méthode basique avec PyTorch natif"""

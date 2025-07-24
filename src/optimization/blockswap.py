@@ -18,9 +18,27 @@ import torch
 import weakref
 import psutil
 import gc
-import comfy.model_management as mm
 from typing import Dict, Any, List, Tuple, Optional, Union
-from src.optimization.memory_manager import get_vram_usage
+# Note: get_vram_usage imported locally in SeedVR2BlockSwap class to avoid circular imports
+
+# Optional ComfyUI import with fallback
+try:
+    import comfy.model_management as mm
+    COMFYUI_AVAILABLE = True
+except ImportError:
+    # Fallback when ComfyUI is not available
+    class FallbackModelManagement:
+        @staticmethod
+        def unet_offload_device():
+            return "cpu"
+        
+        @staticmethod
+        def soft_empty_cache():
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+    
+    mm = FallbackModelManagement()
+    COMFYUI_AVAILABLE = False
 
 
 
@@ -99,7 +117,16 @@ class BlockSwapDebugger:
         if self.enabled:
             # GPU Memory
             if torch.cuda.is_available():
-                allocated_gb, reserved_gb, peak_gb = get_vram_usage()
+                try:
+                    # Try to import and use the memory manager function
+                    from src.optimization.memory_manager import get_vram_usage as _get_vram_usage
+                    allocated_gb, reserved_gb, peak_gb = _get_vram_usage()
+                except ImportError:
+                    # Fallback to basic PyTorch memory info
+                    allocated_gb = torch.cuda.memory_allocated() / (1024**3)
+                    reserved_gb = torch.cuda.memory_reserved() / (1024**3)
+                    peak_gb = torch.cuda.max_memory_allocated() / (1024**3)
+                
                 vram_info = f"VRAM: {allocated_gb:.2f}/{reserved_gb:.2f}GB (peak: {peak_gb:.2f}GB)"
                 self.vram_history.append(allocated_gb)
             else:
@@ -723,6 +750,133 @@ def cleanup_blockswap(runner, keep_state_for_cache: bool = False) -> None:
 
     # Final memory cleanup
     mm.soft_empty_cache()
+
+
+class SeedVR2BlockSwap:
+    """
+    SeedVR2 Block Swap Manager Class
+    
+    This class provides the interface expected by STAR's SeedVR2 integration.
+    It wraps the functional block swap implementation for object-oriented usage.
+    """
+    
+    def __init__(self, enable_debug: bool = False):
+        """
+        Initialize SeedVR2 block swap manager.
+        
+        Args:
+            enable_debug: Whether to enable debug logging
+        """
+        self.enable_debug = enable_debug
+        self.debugger = BlockSwapDebugger(enabled=enable_debug)
+        self.active_runner = None
+        self.current_config = None
+        
+    def log(self, message: str, level: str = "INFO") -> None:
+        """Log a message if debugging is enabled."""
+        if self.enable_debug:
+            print(f"[{level}] BlockSwap: {message}")
+    
+    def get_module_memory_mb(self, module: torch.nn.Module) -> float:
+        """Calculate memory usage of a module in MB."""
+        return get_module_memory_mb(module)
+    
+    def get_vram_usage(self) -> Dict[str, float]:
+        """Get current VRAM usage information."""
+        if torch.cuda.is_available():
+            try:
+                # Import here to avoid circular imports
+                from src.optimization.memory_manager import get_vram_usage as _get_vram_usage
+                allocated_gb, reserved_gb, peak_gb = _get_vram_usage()
+                return {
+                    "allocated": allocated_gb,
+                    "reserved": reserved_gb, 
+                    "peak": peak_gb
+                }
+            except ImportError:
+                # Fallback to basic PyTorch memory info
+                allocated = torch.cuda.memory_allocated() / (1024**3)
+                reserved = torch.cuda.memory_reserved() / (1024**3)
+                peak = torch.cuda.max_memory_allocated() / (1024**3)
+                return {
+                    "allocated": allocated,
+                    "reserved": reserved,
+                    "peak": peak
+                }
+        else:
+            return {"allocated": 0.0, "reserved": 0.0, "peak": 0.0}
+    
+    def apply_block_swap(self, model, blocks_to_swap: int, offload_io: bool = False, model_caching: bool = False):
+        """
+        Apply block swapping to a model.
+        
+        Args:
+            model: The model to apply block swapping to
+            blocks_to_swap: Number of blocks to swap (0=disabled)
+            offload_io: Whether to offload I/O components
+            model_caching: Whether to enable model caching
+        """
+        if blocks_to_swap <= 0:
+            self.log("Block swap disabled (blocks_to_swap=0)")
+            return
+            
+        if not hasattr(model, 'blocks'):
+            self.log("Model doesn't have 'blocks' attribute for BlockSwap", "WARN")
+            return
+            
+        total_blocks = len(model.blocks)
+        blocks_to_swap = min(blocks_to_swap, total_blocks)
+        
+        self.log(f"Applying block swap: {blocks_to_swap}/{total_blocks} blocks")
+        
+        # Create block swap configuration
+        block_swap_config = {
+            "blocks_to_swap": blocks_to_swap,
+            "offload_io_components": offload_io,
+            "use_non_blocking": True,
+            "enable_debug": self.enable_debug
+        }
+        
+        # Apply using the functional interface
+        try:
+            # Create a dummy runner object to hold the model
+            class DummyRunner:
+                def __init__(self, model):
+                    self.dit = model
+            
+            dummy_runner = DummyRunner(model)
+            
+            # Apply block swap using the functional interface
+            apply_block_swap_to_dit(dummy_runner, block_swap_config)
+            
+            # Store configuration for cleanup
+            self.current_config = block_swap_config
+            self.active_runner = dummy_runner
+            
+            self.log(f"Block swap applied successfully")
+            
+        except Exception as e:
+            self.log(f"Block swap application failed: {e}", "ERROR")
+            raise
+    
+    def cleanup(self):
+        """Clean up block swap configurations."""
+        if self.active_runner and self.current_config:
+            try:
+                cleanup_blockswap(self.active_runner, keep_state_for_cache=False)
+                self.log("Block swap cleanup completed")
+            except Exception as e:
+                self.log(f"Block swap cleanup failed: {e}", "WARN")
+            finally:
+                self.active_runner = None
+                self.current_config = None
+    
+    def __del__(self):
+        """Ensure cleanup on deletion."""
+        try:
+            self.cleanup()
+        except:
+            pass  # Ignore errors during cleanup in destructor
 
 
 
