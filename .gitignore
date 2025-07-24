@@ -23,4 +23,6 @@ src/core/subprocess_runner.py
 models/video_vae_v3_mine_bad/
 src/processing/
 TILE_VAE*
-models
+a1.mp4
+models/
+outputs/

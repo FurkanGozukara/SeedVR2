@@ -30,13 +30,12 @@ from src.optimization.performance import (
     optimized_sample_to_image_format, temporal_latent_blending
 )
 from src.common.seed import set_seed
-
-# Optional ComfyUI import with fallback
 try:
     import comfy.model_management
     COMFYUI_AVAILABLE = True
-except ImportError:
+except:
     COMFYUI_AVAILABLE = False
+    pass
 # Get script directory for embeddings
 script_directory = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
