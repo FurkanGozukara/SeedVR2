@@ -31,6 +31,12 @@ from src.optimization.performance import (
 )
 from src.common.seed import set_seed
 try:
+    # Use local comfy copy from STAR instead of system ComfyUI
+    import sys
+    import os
+    star_logic_path = os.path.join(os.path.dirname(__file__), '..', '..', '..', 'STAR', 'logic')
+    if star_logic_path not in sys.path:
+        sys.path.insert(0, star_logic_path)
     import comfy.model_management
     COMFYUI_AVAILABLE = True
 except:

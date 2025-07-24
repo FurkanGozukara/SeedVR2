@@ -12,6 +12,11 @@ import time
 from typing import Tuple, Optional
 from src.common.cache import Cache
 from src.models.dit_v2.rope import RotaryEmbeddingBase
+# Use local comfy copy from STAR instead of system ComfyUI
+import sys
+star_logic_path = os.path.join(os.path.dirname(__file__), '..', '..', '..', 'STAR', 'logic')
+if star_logic_path not in sys.path:
+    sys.path.insert(0, star_logic_path)
 from comfy import model_management as mm
 
 def get_basic_vram_info():

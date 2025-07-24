@@ -18,6 +18,12 @@ import torch
 import weakref
 import psutil
 import gc
+# Use local comfy copy from STAR instead of system ComfyUI
+import sys
+import os
+star_logic_path = os.path.join(os.path.dirname(__file__), '..', '..', '..', 'STAR', 'logic')
+if star_logic_path not in sys.path:
+    sys.path.insert(0, star_logic_path)
 import comfy.model_management as mm
 from typing import Dict, Any, List, Tuple, Optional, Union
 from src.optimization.memory_manager import get_vram_usage
