@@ -187,7 +187,7 @@ def cut_videos(videos):
     return result
 
 
-def generation_loop(runner, images, cfg_scale=1.0, seed=666, res_w=720, batch_size=90, preserve_vram=False, temporal_overlap=0, debug=False, block_swap_config=None, progress_callback=None):
+def generation_loop(runner, images, cfg_scale=1.0, seed=666, res_w=720, batch_size=90, preserve_vram=False, temporal_overlap=0, debug=False, block_swap_config=None, progress_callback=None, frame_save_callback=None):
     """
     Main generation loop with context-aware temporal processing
     
@@ -203,6 +203,8 @@ def generation_loop(runner, images, cfg_scale=1.0, seed=666, res_w=720, batch_si
         debug (bool): Debug mode
         block_swap_config (dict): Optional BlockSwap configuration
         progress_callback (callable): Optional callback for progress reporting
+        frame_save_callback (callable): Optional callback for saving frames as batches complete
+            Called with (batch_tensor, batch_num, start_idx, end_idx)
         
     Returns:
         torch.Tensor: Generated video frames
@@ -430,6 +432,13 @@ def generation_loop(runner, images, cfg_scale=1.0, seed=666, res_w=720, batch_si
             del sample
             batch_samples.append(sample_cpu)
             #del sample 
+            
+            # Call frame save callback if provided
+            if frame_save_callback:
+                # Calculate actual frame indices for this batch
+                batch_start_idx = start_idx
+                batch_end_idx = batch_start_idx + sample_cpu.shape[0]
+                frame_save_callback(sample_cpu, batch_count, batch_start_idx, batch_end_idx)
             
             # Aggressive cleanup after each batch
             tps = time.time()
