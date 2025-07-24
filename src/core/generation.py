@@ -391,9 +391,13 @@ def generation_loop(runner, images, cfg_scale=1.0, seed=666, res_w=720, batch_si
                 cond_latents = runner.vae_encode([transformed_video])
             if debug:
                 print(f"🔄 VAE encode time: {time.time() - tps_vae} seconds")
-            #tps = time.time()
-            #transformed_video = transformed_video.to("cpu")
-            #print(f"🔄 Transformed video to cpu time: {time.time() - tps} seconds")
+            
+            # Move transformed_video to CPU to reduce VRAM peak when preserve_vram is enabled
+            if preserve_vram:
+                tps = time.time()
+                transformed_video = transformed_video.to("cpu")
+                if debug:
+                    print(f"🔄 Transformed video to cpu time: {time.time() - tps} seconds")
             if debug:
                 print(f"🔄 Cond latents shape: {cond_latents[0].shape}, time: {time.time() - tps_vae} seconds")
             
@@ -414,9 +418,11 @@ def generation_loop(runner, images, cfg_scale=1.0, seed=666, res_w=720, batch_si
             
             # Apply color correction if available
             tps = time.time()
-            transformed_video = transformed_video.to(device)
-            if debug:
-                print(f"🔄 Transformed video to device time: {time.time() - tps} seconds")
+            # Only move to device if it was moved to CPU (when preserve_vram is enabled)
+            if transformed_video.device.type == 'cpu':
+                transformed_video = transformed_video.to(device)
+                if debug:
+                    print(f"🔄 Transformed video to device time: {time.time() - tps} seconds")
             
             input_video = [optimized_single_video_rearrange(transformed_video)]
             del transformed_video
