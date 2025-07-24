@@ -350,6 +350,12 @@ def configure_dit_model_inference(runner, device, checkpoint, config, preserve_v
     else:
         if state_loading_device == "cpu" and not blockswap_active:
             runner.dit.to(device)
+    
+    # IMPORTANT: Clear VRAM cache before loading VAE to prevent spike
+    if preserve_vram:
+        torch.cuda.empty_cache()
+        if debug:
+            print(f"🔄 Cleared VRAM cache before VAE loading")
 
     # Log BlockSwap status if active
     if blockswap_active and debug:
@@ -381,7 +387,8 @@ def configure_vae_model_inference(runner, device, checkpoint_path, config, prese
     t = time.time()
     loading_device = "cpu" if preserve_vram else device
     
-    with torch.device(device):
+    # Create VAE on CPU when preserve_vram is enabled to prevent spike
+    with torch.device(loading_device):
         runner.vae = create_object(config.vae.model)
     if debug:
         print(f"🔄 CONFIG VAE : MODEL CREATE TIME: {time.time() - t} seconds device: {device} dtype: {dtype}")
@@ -419,7 +426,8 @@ def configure_vae_model_inference(runner, device, checkpoint_path, config, prese
     '''
     # Load VAE with format detection
     t = time.time()
-    state_loading_device = "cpu" if "7b" in model_weight and vram_info['total_gb'] < 25 else device
+    # When preserve_vram is enabled, always load VAE state to CPU first
+    state_loading_device = "cpu" if preserve_vram or ("7b" in model_weight and vram_info['total_gb'] < 25) else device
     print(f"🚀 Loading VAE SafeTensors: {checkpoint_path}")
     # Use optimized loading for all SafeTensors formats
     if "fp8_e4m3fn" in checkpoint_path:
@@ -432,7 +440,8 @@ def configure_vae_model_inference(runner, device, checkpoint_path, config, prese
         print(f"🔄 CONFIG VAE : VAE LOAD TIME: {time.time() - t} seconds")
     t = time.time()
     runner.vae.load_state_dict(state)
-    if state_loading_device == "cpu":
+    # Only move to device if not preserve_vram (it will be moved later when needed)
+    if state_loading_device == "cpu" and not preserve_vram:
         runner.vae.to(device)
     if 'state' in locals():
         del state
