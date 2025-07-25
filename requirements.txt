@@ -4,3 +4,4 @@ diffusers>=0.34.0                # Diffusers
 pytorch-extension #pytorch extension
 rotary_embedding_torch
 opencv-python
+peft>=0.15.0
