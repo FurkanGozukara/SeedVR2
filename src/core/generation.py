@@ -479,6 +479,10 @@ def generation_loop(runner, images, cfg_scale=1.0, seed=666, res_w=720, batch_si
             if debug:
                 print(f"🔄 Time batch: {batch_time:.2f} seconds")
             print(f"⏱️  Batch time: {batch_time:.1f}s | Avg: {avg_batch_time:.1f}s | ETA: {eta_str}")
+            
+            # Report batch time for external tracking
+            if hasattr(progress_callback, '__self__') and hasattr(progress_callback.__self__, 'track_batch_time'):
+                progress_callback.__self__.track_batch_time(batch_time)
             # Clean VRAM after each batch when preserve_vram is active (but not with blockswap)
             if preserve_vram and not (block_swap_config and block_swap_config.get("blocks_to_swap", 0) > 0):
                 torch.cuda.empty_cache()
@@ -557,6 +561,19 @@ def generation_loop(runner, images, cfg_scale=1.0, seed=666, res_w=720, batch_si
     
     # Cleanup batch_samples
     #del batch_samples
+    
+    # Calculate total processing time
+    if batch_times:
+        total_time = time.time() - start_time
+        if total_time > 60:
+            total_minutes = int(total_time / 60)
+            total_secs = int(total_time % 60)
+            time_str = f"{total_minutes}m {total_secs}s"
+        else:
+            time_str = f"{int(total_time)}s"
+        
+        print(f"\n✅ Generation complete! Total time: {time_str} | Processed {len(batch_times)} batches | Avg: {sum(batch_times)/len(batch_times):.1f}s per batch")
+    
     return final_video_images
 
 
