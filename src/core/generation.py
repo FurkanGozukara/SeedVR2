@@ -293,6 +293,10 @@ def generation_loop(runner, images, cfg_scale=1.0, seed=666, res_w=720, batch_si
     batch_samples = []
     final_tensor = None
     
+    # For ETA tracking
+    batch_times = []
+    start_time = time.time()
+    
     # Load text embeddings with adaptive dtype
     text_pos_embeds = torch.load(os.path.join(script_directory, 'pos_emb.pt')).to(device, dtype=compute_dtype)
     text_neg_embeds = torch.load(os.path.join(script_directory, 'neg_emb.pt')).to(device, dtype=compute_dtype)
@@ -348,7 +352,9 @@ def generation_loop(runner, images, cfg_scale=1.0, seed=666, res_w=720, batch_si
             tps_loop = time.time()
             batch_number = (batch_idx // step + 1) if step > 0 else 1
             current_frames = end_idx - start_idx
-            print(f"\n🎬 Batch {batch_number}: frames {start_idx}-{end_idx-1}")
+            percent_complete = int((batch_number / total_batches) * 100)
+            frames_remaining = len(images) - end_idx
+            print(f"\n🎬 Batch {batch_number}/{total_batches} ({percent_complete}%): frames {start_idx}-{end_idx-1} | {frames_remaining} frames left")
             
 
             
@@ -450,11 +456,29 @@ def generation_loop(runner, images, cfg_scale=1.0, seed=666, res_w=720, batch_si
             tps = time.time()
                         # Progress callback - batch start
             if progress_callback:
-                progress_callback(batch_count+1, total_batches, current_frames, "Processing batch...")
+                # Pass frame range information for better status display
+                progress_callback(batch_count+1, total_batches, current_frames, f"frames {start_idx}-{end_idx-1}")
             #transformed_video = transformed_video.to("cpu")
             #print(f"🔄 Transformed video to cpu time: {time.time() - tps} seconds")
+            
+            # Calculate batch time and ETA
+            batch_time = time.time() - tps_loop
+            batch_times.append(batch_time)
+            avg_batch_time = sum(batch_times) / len(batch_times)
+            batches_remaining = total_batches - batch_number
+            eta_seconds = avg_batch_time * batches_remaining
+            
+            # Format ETA
+            if eta_seconds > 60:
+                eta_minutes = int(eta_seconds / 60)
+                eta_secs = int(eta_seconds % 60)
+                eta_str = f"{eta_minutes}m {eta_secs}s"
+            else:
+                eta_str = f"{int(eta_seconds)}s"
+            
             if debug:
-                print(f"🔄 Time batch: {time.time() - tps_loop} seconds")
+                print(f"🔄 Time batch: {batch_time:.2f} seconds")
+            print(f"⏱️  Batch time: {batch_time:.1f}s | Avg: {avg_batch_time:.1f}s | ETA: {eta_str}")
             # Clean VRAM after each batch when preserve_vram is active (but not with blockswap)
             if preserve_vram and not (block_swap_config and block_swap_config.get("blocks_to_swap", 0) > 0):
                 torch.cuda.empty_cache()
