@@ -54,7 +54,8 @@ from src.utils.color_fix import wavelet_reconstruction
 
 
 
-def generation_step(runner, text_embeds_dict, preserve_vram, cond_latents, temporal_overlap):
+def generation_step(runner, text_embeds_dict, preserve_vram, cond_latents, temporal_overlap, 
+                   tiled_vae=False, tile_size=(64, 64), tile_stride=(32, 32)):
     """
     Execute a single generation step with adaptive dtype handling
     
@@ -142,6 +143,9 @@ def generation_step(runner, text_embeds_dict, preserve_vram, cond_latents, tempo
                 temporal_overlap=temporal_overlap,
                 use_blockswap=use_blockswap,
                 dit_preserve_vram=dit_preserve_vram,  # Separate flag for DiT offloading
+                tiled_vae=tiled_vae,
+                tile_size=tile_size,
+                tile_stride=tile_stride,
                 **text_embeds_dict,
             )
     
@@ -189,7 +193,7 @@ def cut_videos(videos):
     return result
 
 
-def generation_loop(runner, images, cfg_scale=1.0, seed=666, res_w=720, batch_size=90, preserve_vram=False, temporal_overlap=0, debug=False, block_swap_config=None, progress_callback=None, frame_save_callback=None):
+def generation_loop(runner, images, cfg_scale=1.0, seed=666, res_w=720, batch_size=90, preserve_vram=False, temporal_overlap=0, debug=False, block_swap_config=None, progress_callback=None, frame_save_callback=None, tiled_vae=False, tile_size=(64, 64), tile_stride=(32, 32)):
     """
     Main generation loop with context-aware temporal processing
     
@@ -410,7 +414,9 @@ def generation_loop(runner, images, cfg_scale=1.0, seed=666, res_w=720, batch_si
                 print(f"🔄 Cond latents shape: {cond_latents[0].shape}, time: {time.time() - tps_vae} seconds")
             
             # Normal generation
-            samples = generation_step(runner, text_embeds, preserve_vram, cond_latents=cond_latents, temporal_overlap=temporal_overlap)
+            samples = generation_step(runner, text_embeds, preserve_vram, cond_latents=cond_latents, 
+                                    temporal_overlap=temporal_overlap, tiled_vae=tiled_vae, 
+                                    tile_size=tile_size, tile_stride=tile_stride)
             #del cond_latents
             del cond_latents
                

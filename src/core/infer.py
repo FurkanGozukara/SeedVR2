@@ -163,9 +163,25 @@ class VideoDiffusionInfer():
     
 
     @torch.no_grad()
-    def vae_decode(self, latents: List[Tensor], target_dtype: torch.dtype = None, preserve_vram: bool = False) -> List[Tensor]:
-        """🚀 VAE decode optimisé - décodage direct sans chunking, compatible avec autocast externe"""
-        print(f"🔍 vae_decode called with preserve_vram={preserve_vram}")
+    def vae_decode(self, latents: List[Tensor], target_dtype: torch.dtype = None, preserve_vram: bool = False, 
+                   tiled: bool = False, tile_size: Tuple[int, int] = (64, 64), 
+                   tile_stride: Tuple[int, int] = (32, 32)) -> List[Tensor]:
+        """🚀 VAE decode optimisé - décodage direct sans chunking, compatible avec autocast externe
+        
+        Args:
+            latents: List of latent tensors to decode
+            target_dtype: Target dtype for decoding
+            preserve_vram: Whether to preserve VRAM by offloading
+            tiled: Whether to use tiled VAE decoding for reduced VRAM usage
+            tile_size: Size of tiles in latent space (height, width)
+            tile_stride: Stride between tiles in latent space (height, width)
+        """
+        print(f"🔍 vae_decode called with preserve_vram={preserve_vram}, tiled={tiled}")
+        
+        # Only use tiled decoding if explicitly requested via tiled parameter
+        if tiled:
+            return self._tiled_vae_decode(latents, target_dtype, tile_size, tile_stride)
+        
         samples = []
         if len(latents) > 0:
             #t = time.time()
@@ -262,6 +278,169 @@ class VideoDiffusionInfer():
             #t = time.time()
         return samples
 
+    @torch.no_grad()
+    def _tiled_vae_decode(self, latents: List[Tensor], target_dtype: torch.dtype = None, 
+                          tile_size: Tuple[int, int] = (64, 64), 
+                          tile_stride: Tuple[int, int] = (32, 32)) -> List[Tensor]:
+        """Tiled VAE decoding for reduced VRAM usage
+        
+        Splits latent into overlapping tiles, decodes each separately, 
+        then blends overlapping regions to avoid seams.
+        """
+        print(f"🔧 Starting tiled VAE decode with tile_size={tile_size}, tile_stride={tile_stride}")
+        
+        device = get_device()
+        dtype = getattr(torch, self.config.vae.dtype)
+        scale = self.config.vae.scaling_factor
+        shift = self.config.vae.get("shifting_factor", 0.0)
+        
+        if isinstance(scale, ListConfig):
+            scale = torch.tensor(scale, device=device, dtype=dtype)
+        if isinstance(shift, ListConfig):
+            shift = torch.tensor(shift, device=device, dtype=dtype)
+        
+        effective_dtype = target_dtype if target_dtype is not None else dtype
+        
+        samples = []
+        upsampling_factor = 8  # VAE upsampling factor
+        
+        for i, latent in enumerate(latents):
+            # Move latent to device and prepare
+            latent = latent.to(device, effective_dtype, non_blocking=True)
+            latent = latent / scale + shift
+            latent = rearrange(latent, "b ... c -> b c ...")
+            
+            # Handle temporal dimension if present
+            temporal_frames = latent.shape[2] if latent.ndim >= 5 else 1
+            
+            # For temporal VAE, we need to handle it differently
+            if temporal_frames > 1:
+                print(f"⚠️ Tiled decoding for temporal VAE not fully implemented, falling back to standard decode")
+                # Squeeze temporal dimension and decode normally
+                latent = latent.squeeze(2)
+                sample = self.vae.decode(latent, preserve_vram).sample
+            else:
+                # Squeeze temporal dimension for 2D processing
+                if latent.ndim == 5:
+                    latent = latent.squeeze(2)
+                
+                # Get dimensions
+                b, c, h, w = latent.shape
+                
+                # Calculate output dimensions
+                out_h = h * upsampling_factor
+                out_w = w * upsampling_factor
+                
+                # Initialize output tensors
+                weight = torch.zeros((b, 1, out_h, out_w), dtype=effective_dtype, device="cpu")
+                output = torch.zeros((b, 3, out_h, out_w), dtype=effective_dtype, device="cpu")
+                
+                # Calculate tile parameters
+                tile_h, tile_w = tile_size
+                stride_h, stride_w = tile_stride
+                
+                # Split into tiles and process
+                tiles_processed = 0
+                for y in range(0, h, stride_h):
+                    # Skip if we've already covered this area
+                    if y > 0 and y + tile_h > h and y - stride_h + tile_h >= h:
+                        continue
+                        
+                    for x in range(0, w, stride_w):
+                        # Skip if we've already covered this area
+                        if x > 0 and x + tile_w > w and x - stride_w + tile_w >= w:
+                            continue
+                        
+                        # Calculate tile boundaries
+                        y_end = min(y + tile_h, h)
+                        x_end = min(x + tile_w, w)
+                        
+                        # Extract tile
+                        tile_latent = latent[:, :, y:y_end, x:x_end]
+                        
+                        # Decode tile
+                        tile_sample = self.vae.decode(tile_latent, preserve_vram).sample
+                        
+                        # Create blend mask for smooth transitions
+                        mask = self._create_tile_mask(
+                            tile_sample.shape,
+                            is_boundary=(y == 0, y_end >= h, x == 0, x_end >= w),
+                            border_width=((tile_h - stride_h) * upsampling_factor, 
+                                        (tile_w - stride_w) * upsampling_factor)
+                        ).to(dtype=effective_dtype, device="cpu")
+                        
+                        # Calculate output position
+                        out_y = y * upsampling_factor
+                        out_x = x * upsampling_factor
+                        out_y_end = y_end * upsampling_factor
+                        out_x_end = x_end * upsampling_factor
+                        
+                        # Move tile to CPU and accumulate
+                        tile_cpu = tile_sample.to("cpu")
+                        output[:, :, out_y:out_y_end, out_x:out_x_end] += tile_cpu * mask
+                        weight[:, :, out_y:out_y_end, out_x:out_x_end] += mask
+                        
+                        tiles_processed += 1
+                        
+                        # Clear CUDA cache periodically
+                        if tiles_processed % 4 == 0:
+                            torch.cuda.empty_cache()
+                
+                print(f"✅ Processed {tiles_processed} tiles")
+                
+                # Normalize by weight to blend overlapping regions
+                sample = output / weight.clamp(min=1e-8)
+                sample = sample.to(device)
+            
+            # Post-process if needed
+            if hasattr(self.vae, "postprocess"):
+                sample = self.vae.postprocess(sample)
+            
+            # Rearrange back to original format
+            sample = optimized_channels_to_last(sample)
+            samples.append(sample)
+            
+            # Clean up
+            torch.cuda.empty_cache()
+        
+        return samples
+    
+    def _create_tile_mask(self, shape: Tuple[int, ...], is_boundary: Tuple[bool, bool, bool, bool], 
+                         border_width: Tuple[int, int]) -> torch.Tensor:
+        """Create blending mask for tile with smooth transitions at borders"""
+        b, c, h, w = shape
+        
+        # Create 1D masks for height and width
+        h_mask = torch.ones(h)
+        w_mask = torch.ones(w)
+        
+        border_h, border_w = border_width
+        
+        # Apply gradients at non-boundary edges
+        if not is_boundary[0] and border_h > 0:  # Top
+            gradient = torch.linspace(0, 1, min(border_h, h))
+            h_mask[:len(gradient)] = gradient
+            
+        if not is_boundary[1] and border_h > 0:  # Bottom
+            gradient = torch.linspace(1, 0, min(border_h, h))
+            h_mask[-len(gradient):] = gradient
+            
+        if not is_boundary[2] and border_w > 0:  # Left
+            gradient = torch.linspace(0, 1, min(border_w, w))
+            w_mask[:len(gradient)] = gradient
+            
+        if not is_boundary[3] and border_w > 0:  # Right
+            gradient = torch.linspace(1, 0, min(border_w, w))
+            w_mask[-len(gradient):] = gradient
+        
+        # Create 2D mask by outer product
+        mask_2d = h_mask.view(-1, 1) * w_mask.view(1, -1)
+        
+        # Expand to match input shape
+        mask = mask_2d.unsqueeze(0).unsqueeze(0).expand(b, 1, h, w)
+        
+        return mask
+
     def timestep_transform(self, timesteps: Tensor, latents_shapes: Tensor):
         # Skip if not needed.
         if not self.config.diffusion.timesteps.get("transform", False):
@@ -326,6 +505,9 @@ class VideoDiffusionInfer():
         temporal_overlap: int = 0,
         use_blockswap: bool = False,
         dit_preserve_vram: bool = None,  # Separate flag for DiT offloading
+        tiled_vae: bool = False,  # Enable tiled VAE decoding
+        tile_size: Tuple[int, int] = (64, 64),  # Tile size in latent space
+        tile_stride: Tuple[int, int] = (32, 32),  # Tile stride in latent space
     ) -> List[Tensor]:
         assert len(noises) == len(conditions) == len(texts_pos) == len(texts_neg)
         batch_size = len(noises)
@@ -506,7 +688,14 @@ class VideoDiffusionInfer():
         log_vram_usage("Before VAE Decode", f"Starting decode of {len(latents)} latents")
         
         #with torch.autocast("cuda", decode_dtype, enabled=True):
-        samples = self.vae_decode(latents, target_dtype=decode_dtype, preserve_vram=preserve_vram)
+        samples = self.vae_decode(
+            latents, 
+            target_dtype=decode_dtype, 
+            preserve_vram=preserve_vram,
+            tiled=tiled_vae,
+            tile_size=tile_size,
+            tile_stride=tile_stride
+        )
         
         # Log after VAE decode
         log_vram_usage("After VAE Decode", f"Decoded {len(samples)} samples")
