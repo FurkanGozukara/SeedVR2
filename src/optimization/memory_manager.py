@@ -62,8 +62,12 @@ def clear_vram_cache() -> None:
     """
     print("🧹 Clearing VRAM cache...")
     if torch.cuda.is_available():
-        torch.cuda.empty_cache()
+        # Multiple rounds of cleanup for thorough memory defragmentation
         gc.collect()
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+        gc.collect()
+        torch.cuda.empty_cache()
 
 
 def reset_vram_peak() -> None:

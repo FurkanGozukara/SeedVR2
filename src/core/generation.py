@@ -483,8 +483,9 @@ def generation_loop(runner, images, cfg_scale=1.0, seed=666, res_w=720, batch_si
             # Report batch time for external tracking
             if hasattr(progress_callback, '__self__') and hasattr(progress_callback.__self__, 'track_batch_time'):
                 progress_callback.__self__.track_batch_time(batch_time)
-            # Clean VRAM after each batch when preserve_vram is active (but not with blockswap)
-            if preserve_vram and not (block_swap_config and block_swap_config.get("blocks_to_swap", 0) > 0):
+            # Clean VRAM after each batch when preserve_vram is active
+            # Modified to force cleanup even with BlockSwap for lower VRAM usage
+            if preserve_vram:
                 torch.cuda.empty_cache()
             #del transformed_video
             #clear_vram_cache()

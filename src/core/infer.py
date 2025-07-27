@@ -425,6 +425,18 @@ class VideoDiffusionInfer():
             if self.debug:
                 print(f"🔄 Dit to CPU time: {time.time() - t} seconds")
             
+            # Extra cleanup when BlockSwap was active to defragment memory
+            if hasattr(self, "_blockswap_active") and self._blockswap_active:
+                torch.cuda.synchronize()  # Ensure all operations complete
+                # Clear any cached tensors in DiT blocks
+                if hasattr(self.dit, 'blocks'):
+                    for block in self.dit.blocks:
+                        if hasattr(block, '_cached_tensors'):
+                            del block._cached_tensors
+                torch.cuda.empty_cache()  # Force memory defragmentation
+                if self.debug:
+                    print(f"🔄 Extra BlockSwap cleanup for VAE")
+            
             if latents[0].shape[0] > 1:
                 t = time.time()
                 self.vae = self.vae.to(get_device())

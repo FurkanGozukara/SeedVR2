@@ -374,6 +374,10 @@ def _wrap_block_forward(block: torch.nn.Module, block_idx: int, model: torch.nn.
             # Move back to offload device
             self.to(model.offload_device, non_blocking=model.use_non_blocking)
             
+            # Force synchronization to prevent memory accumulation
+            if model.use_non_blocking:
+                torch.cuda.synchronize()
+            
             # Log timing if debugger is available
             if debugger and t_start is not None:
                 debugger.log_swap_time(
@@ -383,8 +387,12 @@ def _wrap_block_forward(block: torch.nn.Module, block_idx: int, model: torch.nn.
                     direction="compute"
                 )
 
-            # Only clear cache under memory pressure
-            if torch.cuda.memory_allocated() > torch.cuda.get_device_properties(0).total_memory * 0.9:
+            # Clear cache more aggressively to prevent memory accumulation
+            # Lower threshold from 90% to 70% for earlier cleanup
+            if torch.cuda.memory_allocated() > torch.cuda.get_device_properties(0).total_memory * 0.7:
+                mm.soft_empty_cache()
+            # Always clear cache for the first few blocks to establish baseline
+            elif self._block_idx <= 3:
                 mm.soft_empty_cache()
         else:
             output = original_forward(*args, **kwargs)
