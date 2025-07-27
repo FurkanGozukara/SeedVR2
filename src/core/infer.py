@@ -210,8 +210,12 @@ class VideoDiffusionInfer():
                 temporal_frames = latent.shape[2] if latent.ndim >= 5 else 1
                 print(f"🔍 Temporal frames detected: {temporal_frames}, preserve_vram: {preserve_vram}")
                 
-                # 🚀 OPTIMISATION 3: Frame-by-frame VAE decoding when preserve_vram is enabled
-                if preserve_vram and temporal_frames > 1:
+                # 🚀 OPTIMISATION 3: Frame-by-frame VAE decoding DISABLED
+                # The SeedVR2 VAE requires temporal context - decoding frames individually breaks video coherence
+                use_frame_by_frame = False  # Disabled due to temporal artifacts
+                print(f"🔍 Frame-by-frame decision: DISABLED (temporal VAE requires context)")
+                
+                if use_frame_by_frame and preserve_vram and temporal_frames > 1:
                     print(f"✅ Using frame-by-frame VAE decode for {temporal_frames} frames")
                     if self.debug:
                         print(f"🔄 Frame-by-frame VAE decode: {temporal_frames} frames")
