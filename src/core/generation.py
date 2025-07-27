@@ -133,13 +133,15 @@ def generation_step(runner, text_embeds_dict, preserve_vram, cond_latents, tempo
     # Use adaptive autocast for optimal performance
     with torch.no_grad():
         with torch.autocast("cuda", autocast_dtype, enabled=True):
+            # Keep original preserve_vram value for VAE operations
+            dit_preserve_vram = preserve_vram and not use_blockswap  # Disable DiT offload if BlockSwap active
             video_tensors = runner.inference(
                 noises=noises,
                 conditions=conditions,
-                preserve_vram=preserve_vram  # Memory offload optimization
-                and not use_blockswap,  # Disable dit_offload if BlockSwap active
+                preserve_vram=preserve_vram,  # Pass original value so VAE can use it
                 temporal_overlap=temporal_overlap,
                 use_blockswap=use_blockswap,
+                dit_preserve_vram=dit_preserve_vram,  # Separate flag for DiT offloading
                 **text_embeds_dict,
             )
     

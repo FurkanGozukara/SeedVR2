@@ -56,6 +56,46 @@ def get_vram_usage() -> Tuple[float, float, float]:
     return 0, 0, 0
 
 
+def log_vram_usage(stage: str, details: str = "") -> None:
+    """
+    Log comprehensive VRAM usage at a specific stage
+    
+    Args:
+        stage: Description of the current stage (e.g., "Before Inference", "After VAE")
+        details: Additional details to include in the log
+    """
+    if torch.cuda.is_available():
+        # Get memory info
+        free_memory, total_memory = torch.cuda.mem_get_info()
+        allocated = torch.cuda.memory_allocated()
+        reserved = torch.cuda.memory_reserved()
+        max_allocated = torch.cuda.max_memory_allocated()
+        
+        # Convert to GB
+        total_gb = total_memory / (1024**3)
+        free_gb = free_memory / (1024**3)
+        used_gb = (total_memory - free_memory) / (1024**3)
+        allocated_gb = allocated / (1024**3)
+        reserved_gb = reserved / (1024**3)
+        max_allocated_gb = max_allocated / (1024**3)
+        
+        # Calculate percentage
+        usage_percent = (used_gb / total_gb) * 100
+        
+        print(f"\n{'='*60}")
+        print(f"📊 VRAM Status - {stage}")
+        if details:
+            print(f"   {details}")
+        print(f"{'='*60}")
+        print(f"🎮 Total GPU VRAM:     {total_gb:.2f} GB")
+        print(f"🔵 Used (Total):       {used_gb:.2f} GB ({usage_percent:.1f}%)")
+        print(f"🟢 Free:               {free_gb:.2f} GB")
+        print(f"🟡 PyTorch Allocated:  {allocated_gb:.2f} GB")
+        print(f"🟠 PyTorch Reserved:   {reserved_gb:.2f} GB")
+        print(f"🔴 Peak Allocated:     {max_allocated_gb:.2f} GB")
+        print(f"{'='*60}\n")
+
+
 def clear_vram_cache() -> None:
     """
     Clear VRAM cache and run garbage collection
