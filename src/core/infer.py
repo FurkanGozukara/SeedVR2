@@ -180,7 +180,7 @@ class VideoDiffusionInfer():
         
         # Only use tiled decoding if explicitly requested via tiled parameter
         if tiled:
-            return self._tiled_vae_decode(latents, target_dtype, tile_size, tile_stride)
+            return self._tiled_vae_decode(latents, target_dtype, tile_size, tile_stride, preserve_vram)
         
         samples = []
         if len(latents) > 0:
@@ -281,7 +281,8 @@ class VideoDiffusionInfer():
     @torch.no_grad()
     def _tiled_vae_decode(self, latents: List[Tensor], target_dtype: torch.dtype = None, 
                           tile_size: Tuple[int, int] = (64, 64), 
-                          tile_stride: Tuple[int, int] = (32, 32)) -> List[Tensor]:
+                          tile_stride: Tuple[int, int] = (32, 32),
+                          preserve_vram: bool = True) -> List[Tensor]:
         """Tiled VAE decoding for reduced VRAM usage
         
         Splits latent into overlapping tiles, decodes each separately, 
