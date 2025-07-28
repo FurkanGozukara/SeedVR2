@@ -383,6 +383,10 @@ def _wrap_block_forward(block: torch.nn.Module, block_idx: int, model: torch.nn.
 
                 # Only move to GPU if necessary
                 if current_device != target_device:
+                    # CRITICAL: Set memory fraction to 100% for swap operations
+                    if torch.cuda.is_available() and hasattr(torch.cuda, 'set_per_process_memory_fraction'):
+                        torch.cuda.set_per_process_memory_fraction(1.0)
+                    
                     self.to(model.main_device, non_blocking=model.use_non_blocking)
                     
                 # Synchronize if needed
@@ -424,6 +428,13 @@ def _wrap_block_forward(block: torch.nn.Module, block_idx: int, model: torch.nn.
                     # First time moving this block to GPU
                     if debugger and debugger.enabled:
                         debugger.log(f"Moving block {self._block_idx} to GPU (one-time move)")
+                    
+                    # CRITICAL: Temporarily set memory fraction to 100% for block loading
+                    if torch.cuda.is_available() and hasattr(torch.cuda, 'set_per_process_memory_fraction'):
+                        torch.cuda.set_per_process_memory_fraction(1.0)
+                        if debugger and debugger.enabled:
+                            debugger.log(f"Set memory fraction to 100% for block {self._block_idx} loading")
+                    
                     self.to(model.main_device, non_blocking=model.use_non_blocking)
                     
                     # Synchronize if needed
@@ -486,6 +497,10 @@ def _wrap_io_forward(module: torch.nn.Module, module_name: str, model: torch.nn.
         
         # Move to GPU for computation if needed
         if current_device != target_device:
+            # CRITICAL: Set memory fraction to 100% for I/O swap operations
+            if torch.cuda.is_available() and hasattr(torch.cuda, 'set_per_process_memory_fraction'):
+                torch.cuda.set_per_process_memory_fraction(1.0)
+            
             self.to(model.main_device)
             
         # Synchronize if not using non-blocking transfers

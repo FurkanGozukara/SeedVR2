@@ -703,6 +703,12 @@ class VideoDiffusionInfer():
             # Log updated VRAM status
             log_vram_usage("After Memory Release", f"Memory fraction set to {memory_fraction*100:.0f}%")
         
+        # CRITICAL: Set memory fraction to 100% before DiT inference starts
+        # This ensures blocks can be loaded without memory restrictions
+        if torch.cuda.is_available() and hasattr(torch.cuda, 'set_per_process_memory_fraction'):
+            torch.cuda.set_per_process_memory_fraction(1.0)
+            print(f"🔍 PRE-SAMPLER: Set memory fraction to 100% for DiT inference")
+        
         # DETAILED LOGGING before sampler starts
         print(f"🔍 PRE-SAMPLER DEBUG: About to start EulerSampler")
         print(f"🔍 PRE-SAMPLER DEBUG: DiT device = {next(self.dit.parameters()).device}")
