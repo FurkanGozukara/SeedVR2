@@ -837,6 +837,35 @@ class VideoDiffusionInfer():
         # Log before VAE decode
         log_vram_usage("Before VAE Decode", f"Starting decode of {len(latents)} latents")
         
+        # AGGRESSIVE VRAM CLEANUP before VAE decode - clear ALL accumulated memory
+        # This is especially important for 7B models which accumulate more intermediate tensors
+        aggressive_cleanup = preserve_vram or (hasattr(self, '_blockswap_active') and self._blockswap_active)
+        
+        if torch.cuda.is_available() and aggressive_cleanup:
+            print("🧹 Performing aggressive VRAM cleanup before VAE decode...")
+            
+            # 1. Synchronize to ensure all CUDA operations are complete
+            torch.cuda.synchronize()
+            
+            # 2. Clear all CUDA caches
+            torch.cuda.empty_cache()
+            
+            # 3. Force garbage collection to release any lingering references
+            import gc
+            gc.collect()
+            
+            # 4. Clear PyTorch's internal caches
+            if hasattr(torch.cuda, 'reset_peak_memory_stats'):
+                torch.cuda.reset_peak_memory_stats()
+            
+            # 5. Another empty_cache after GC to ensure everything is cleared
+            torch.cuda.empty_cache()
+            
+            # Log VRAM status after aggressive cleanup
+            allocated = torch.cuda.memory_allocated() / (1024**3)
+            reserved = torch.cuda.memory_reserved() / (1024**3)
+            print(f"✅ VRAM after aggressive cleanup: {allocated:.2f}GB allocated, {reserved:.2f}GB reserved")
+        
         # CRITICAL: Set memory fraction to 100% for VAE decode to prevent OOM
         if torch.cuda.is_available() and hasattr(torch.cuda, 'set_per_process_memory_fraction'):
             print("🔍 VAE DECODE: Setting memory fraction to 100% for VAE operations")
