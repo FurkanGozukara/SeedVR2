@@ -315,8 +315,8 @@ def configure_dit_model_inference(runner, device, checkpoint, config, preserve_v
     print(f"🚀 Loading model_weight: {model_weight}")
 
     t = time.time()
-    # Always load state to CPU when preserve_vram is enabled to prevent spike
-    state_loading_device = "cpu" if preserve_vram or ("7b" in model_weight and vram_info['total_gb'] < 25) else device
+    # Always load state to CPU when preserve_vram or blockswap is enabled to prevent spike
+    state_loading_device = "cpu" if preserve_vram or blockswap_active or ("7b" in model_weight and vram_info['total_gb'] < 25) else device
     state = load_quantized_state_dict(checkpoint, state_loading_device, keep_native_fp8=True)
 
     if debug:
@@ -354,16 +354,30 @@ def configure_dit_model_inference(runner, device, checkpoint, config, preserve_v
     if preserve_vram:
         torch.cuda.empty_cache()
 
-    # Move DiT to CPU to prevent VRAM leaks (especially for 3B model with complex RoPE)
-    if preserve_vram and not blockswap_active:
+    # CRITICAL: When blockswap is active, ALWAYS keep model on CPU
+    # Block swap will handle moving blocks to GPU dynamically
+    if blockswap_active:
+        if debug:
+            print(f"🔄 CONFIG DIT : Keeping model on CPU for BlockSwap")
+        # Ensure the model is on CPU
+        current_device = next(runner.dit.parameters()).device
+        if current_device.type != "cpu":
+            runner.dit = runner.dit.to("cpu")
+            if debug:
+                print(f"🔄 CONFIG DIT : Moved model from {current_device} to CPU for BlockSwap")
+    elif preserve_vram:
+        # preserve_vram but no blockswap - keep on CPU
         if debug:
             print(f"🔄 CONFIG DIT : dit to cpu cause preserve_vram: {preserve_vram}")
         runner.dit = runner.dit.to("cpu")
         if "7b" in model_weight:
             clear_vram_cache()
     else:
-        if state_loading_device == "cpu" and not blockswap_active:
-            runner.dit.to(device)
+        # No blockswap, no preserve_vram - can move to GPU
+        if state_loading_device == "cpu":
+            runner.dit = runner.dit.to(device)
+            if debug:
+                print(f"🔄 CONFIG DIT : Moved model to {device}")
     
     # IMPORTANT: Clear VRAM cache before loading VAE to prevent spike
     if preserve_vram:

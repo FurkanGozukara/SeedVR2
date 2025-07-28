@@ -209,15 +209,16 @@ def apply_block_swap_to_dit(runner, block_swap_config: Dict[str, Any]) -> None:
     # Configure block placement and memory tracking
     memory_stats = _configure_blocks(model, device, offload_device, use_non_blocking, debugger)
     memory_stats['io_components'] = io_components_offloaded
+    memory_stats['blocks_to_swap'] = model.blocks_to_swap
 
      # Log memory summary
     _log_memory_summary(memory_stats, offload_device, device, offload_io_components, 
                        use_non_blocking, debugger)
     
-    # Wrap block forward methods for dynamic swapping
+    # Wrap ALL block forward methods for dynamic swapping
+    # This ensures that blocks > blocks_to_swap are also moved to GPU on-demand
     for b, block in enumerate(model.blocks):
-        if b <= model.blocks_to_swap:
-            _wrap_block_forward(block, b, model, debugger)
+        _wrap_block_forward(block, b, model, debugger)
 
     # Patch RoPE modules for robust error handling
     _patch_rope_for_blockswap(model, debugger)
@@ -280,23 +281,26 @@ def _configure_blocks(model, device: str, offload_device: str,
     total_offload_memory = 0.0
     total_main_memory = 0.0
 
-    # Move blocks based on swap configuration
+    # When block swap is enabled, ALL blocks should start on offload_device (CPU)
+    # to prevent initial VRAM spike. Blocks will be moved to GPU dynamically during forward pass.
     for b, block in enumerate(model.blocks):
         block_memory = get_module_memory_mb(block)
 
+        # Always move to offload device initially when block swap is active
+        block.to(offload_device, non_blocking=use_non_blocking)
+        
         if b > model.blocks_to_swap:
-            block.to(device)
+            # These blocks will be dynamically moved to GPU during forward pass
             total_main_memory += block_memory
         else:
-            block.to(offload_device, non_blocking=use_non_blocking)
+            # These blocks will use block swapping
             total_offload_memory += block_memory
 
-    # Ensure all buffers match their containing module's device
+    # Ensure all buffers match their containing module's device (all on offload_device)
     for b, block in enumerate(model.blocks):
-        target_device = device if b > model.blocks_to_swap else offload_device
         for name, buffer in block.named_buffers():
-            if buffer.device != torch.device(target_device):
-                buffer.data = buffer.data.to(target_device)
+            if buffer.device != torch.device(offload_device):
+                buffer.data = buffer.data.to(offload_device)
 
     # Clean up memory
     mm.soft_empty_cache()
@@ -315,10 +319,10 @@ def _log_memory_summary(memory_stats: Dict[str, float], offload_device: str,
     """Log memory usage summary."""
     debugger.log("----------------------")
     debugger.log("Block swap memory summary:")
-    debugger.log(f"Transformer blocks on {offload_device}: {memory_stats['offload_memory']:.2f}MB")
-    debugger.log(f"Transformer blocks on {device}: {memory_stats['main_memory']:.2f}MB")
+    debugger.log(f"Blocks using block-swap (0-{memory_stats.get('blocks_to_swap', 0)}): {memory_stats['offload_memory']:.2f}MB")
+    debugger.log(f"Blocks to be moved to {device} on-demand: {memory_stats['main_memory']:.2f}MB")
     total_memory = memory_stats['offload_memory'] + memory_stats['main_memory']
-    debugger.log(f"Total memory used by transformer blocks: {total_memory:.2f}MB")
+    debugger.log(f"Total transformer blocks memory: {total_memory:.2f}MB (all initially on {offload_device})")
     
     if offload_io_components and memory_stats.get('io_components'):
         debugger.log(f"I/O components offloaded: {', '.join(memory_stats['io_components'])}")
@@ -354,46 +358,62 @@ def _wrap_block_forward(block: torch.nn.Module, block_idx: int, model: torch.nn.
             return original_forward(*args, **kwargs)
 
         # Check if block swap is active for this block
-        if hasattr(model, 'blocks_to_swap') and self._block_idx <= model.blocks_to_swap:
-            t_start = time.time() if debugger and debugger.enabled else None
-
-            # Only move to GPU if necessary
+        if hasattr(model, 'blocks_to_swap'):
             current_device = next(self.parameters()).device
             target_device = torch.device(model.main_device)
             
-            if current_device != target_device:
-                self.to(model.main_device, non_blocking=model.use_non_blocking)
+            if self._block_idx <= model.blocks_to_swap:
+                # This block uses block swapping (move to GPU and back)
+                t_start = time.time() if debugger and debugger.enabled else None
+
+                # Only move to GPU if necessary
+                if current_device != target_device:
+                    self.to(model.main_device, non_blocking=model.use_non_blocking)
+                    
+                # Synchronize if needed
+                if hasattr(model, 'use_non_blocking') and not model.use_non_blocking:
+                    torch.cuda.synchronize()
+
+                # Execute forward pass with OOM protection
+                output = original_forward(*args, **kwargs)
+
+                # Move back to offload device
+                self.to(model.offload_device, non_blocking=model.use_non_blocking)
                 
-            # Synchronize if needed
-            if hasattr(model, 'use_non_blocking') and not model.use_non_blocking:
-                torch.cuda.synchronize()
+                # Force synchronization to prevent memory accumulation
+                if model.use_non_blocking:
+                    torch.cuda.synchronize()
+                
+                # Log timing if debugger is available
+                if debugger and t_start is not None:
+                    debugger.log_swap_time(
+                        component_id=self._block_idx,
+                        duration=time.time() - t_start,
+                        component_type="block",
+                        direction="compute"
+                    )
 
-            # Execute forward pass with OOM protection
-            output = original_forward(*args, **kwargs)
-
-            # Move back to offload device
-            self.to(model.offload_device, non_blocking=model.use_non_blocking)
-            
-            # Force synchronization to prevent memory accumulation
-            if model.use_non_blocking:
-                torch.cuda.synchronize()
-            
-            # Log timing if debugger is available
-            if debugger and t_start is not None:
-                debugger.log_swap_time(
-                    component_id=self._block_idx,
-                    duration=time.time() - t_start,
-                    component_type="block",
-                    direction="compute"
-                )
-
-            # Clear cache more aggressively to prevent memory accumulation
-            # Lower threshold from 90% to 70% for earlier cleanup
-            if torch.cuda.memory_allocated() > torch.cuda.get_device_properties(0).total_memory * 0.7:
-                mm.soft_empty_cache()
-            # Always clear cache for the first few blocks to establish baseline
-            elif self._block_idx <= 3:
-                mm.soft_empty_cache()
+                # Clear cache more aggressively to prevent memory accumulation
+                # Lower threshold from 90% to 70% for earlier cleanup
+                if torch.cuda.memory_allocated() > torch.cuda.get_device_properties(0).total_memory * 0.7:
+                    mm.soft_empty_cache()
+                # Always clear cache for the first few blocks to establish baseline
+                elif self._block_idx <= 3:
+                    mm.soft_empty_cache()
+            else:
+                # This block doesn't use block swapping - move to GPU once and keep it there
+                if current_device != target_device:
+                    # First time moving this block to GPU
+                    if debugger and debugger.enabled:
+                        debugger.log(f"Moving block {self._block_idx} to GPU (one-time move)")
+                    self.to(model.main_device, non_blocking=model.use_non_blocking)
+                    
+                    # Synchronize if needed
+                    if hasattr(model, 'use_non_blocking') and not model.use_non_blocking:
+                        torch.cuda.synchronize()
+                
+                # Execute forward pass normally
+                output = original_forward(*args, **kwargs)
         else:
             output = original_forward(*args, **kwargs)
 

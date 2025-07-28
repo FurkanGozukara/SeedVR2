@@ -590,14 +590,18 @@ class VideoDiffusionInfer():
             # Log after VAE moved to CPU
             log_vram_usage("After VAE to CPU", "VAE offloaded, DiT ready for inference")
             # Before sampling, check if BlockSwap is active
-            if not use_blockswap and not hasattr(self, "_blockswap_active"):
+            # CRITICAL: When BlockSwap is active, DO NOT move model to GPU
+            # BlockSwap will handle device placement block by block
+            if hasattr(self, "_blockswap_active") and self._blockswap_active:
+                # BlockSwap manages device placement
+                if self.debug:
+                    print(f"🔄 BlockSwap active - skipping DiT GPU movement")
+            elif not use_blockswap:
+                # Only move to GPU if BlockSwap is definitely not active
                 t = time.time()
                 self.dit = self.dit.to(get_device())
                 if self.debug:
                     print(f"🔄 Dit to GPU time: {time.time() - t} seconds")
-            else:
-                # BlockSwap manages device placement
-                pass
 
         # Log VRAM before inference
         log_vram_usage("Before DiT Inference", f"Ready to run diffusion, BlockSwap: {use_blockswap}")
