@@ -831,6 +831,11 @@ class VideoDiffusionInfer():
         # Log before VAE decode
         log_vram_usage("Before VAE Decode", f"Starting decode of {len(latents)} latents")
         
+        # CRITICAL: Set memory fraction to 100% for VAE decode to prevent OOM
+        if torch.cuda.is_available() and hasattr(torch.cuda, 'set_per_process_memory_fraction'):
+            print("🔍 VAE DECODE: Setting memory fraction to 100% for VAE operations")
+            torch.cuda.set_per_process_memory_fraction(1.0)
+        
         #with torch.autocast("cuda", decode_dtype, enabled=True):
         samples = self.vae_decode(
             latents, 

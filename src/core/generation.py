@@ -136,6 +136,10 @@ def generation_step(runner, text_embeds_dict, preserve_vram, cond_latents, tempo
         with torch.autocast("cuda", autocast_dtype, enabled=True):
             # Keep original preserve_vram value for VAE operations
             dit_preserve_vram = preserve_vram and not use_blockswap  # Disable DiT offload if BlockSwap active
+            
+            # Debug log tiled VAE settings
+            print(f"🔍 generation.py - process_chunk: tiled_vae={tiled_vae}, tile_size={tile_size}, tile_stride={tile_stride}")
+            
             video_tensors = runner.inference(
                 noises=noises,
                 conditions=conditions,
@@ -223,6 +227,9 @@ def generation_loop(runner, images, cfg_scale=1.0, seed=666, res_w=720, batch_si
         - Intelligent VRAM management throughout process
         - Real-time progress reporting
     """
+    # Debug log tiled VAE configuration
+    print(f"[INFO] 📊 Entering generation_loop - tiled_vae={tiled_vae}, tile_size={tile_size}, tile_stride={tile_stride}")
+    
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     # Log BlockSwap status
