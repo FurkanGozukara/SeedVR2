@@ -238,6 +238,11 @@ def apply_block_swap_to_dit(runner, block_swap_config: Dict[str, Any]) -> None:
         "offload_memory": memory_stats['offload_memory'],
         "main_memory": memory_stats['main_memory']
     }
+    
+    # Store memory management configuration on the model for access during forward pass
+    model.block_memory_cleanup_threshold = block_swap_config.get("block_memory_cleanup_threshold", 0.7)
+    model.io_memory_cleanup_threshold = block_swap_config.get("io_memory_cleanup_threshold", 0.9)
+    model.block_cleanup_first_n = block_swap_config.get("block_cleanup_first_n", 3)
 
     # Protect model from being moved entirely
     _protect_model_from_move(model, runner, debugger)
@@ -404,11 +409,14 @@ def _wrap_block_forward(block: torch.nn.Module, block_idx: int, model: torch.nn.
                     )
 
                 # Clear cache more aggressively to prevent memory accumulation
-                # Lower threshold from 90% to 70% for earlier cleanup
-                if torch.cuda.memory_allocated() > torch.cuda.get_device_properties(0).total_memory * 0.7:
+                # Get cleanup thresholds from model config if available
+                cleanup_threshold = getattr(model, 'block_memory_cleanup_threshold', 0.7)
+                cleanup_first_n = getattr(model, 'block_cleanup_first_n', 3)
+                
+                if torch.cuda.memory_allocated() > torch.cuda.get_device_properties(0).total_memory * cleanup_threshold:
                     mm.soft_empty_cache()
                 # Always clear cache for the first few blocks to establish baseline
-                elif self._block_idx <= 3:
+                elif self._block_idx <= cleanup_first_n:
                     mm.soft_empty_cache()
             else:
                 # This block doesn't use block swapping - move to GPU once and keep it there
@@ -500,7 +508,9 @@ def _wrap_io_forward(module: torch.nn.Module, module_name: str, model: torch.nn.
             )
 
         # Only clear cache under memory pressure
-        if torch.cuda.memory_allocated() > torch.cuda.get_device_properties(0).total_memory * 0.9:
+        # Get cleanup threshold from model config if available
+        io_cleanup_threshold = getattr(model, 'io_memory_cleanup_threshold', 0.9)
+        if torch.cuda.memory_allocated() > torch.cuda.get_device_properties(0).total_memory * io_cleanup_threshold:
             mm.soft_empty_cache()
 
         return output

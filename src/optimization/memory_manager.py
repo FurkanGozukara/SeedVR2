@@ -110,6 +110,146 @@ def clear_vram_cache() -> None:
         torch.cuda.empty_cache()
 
 
+def get_gpu_profile() -> dict:
+    """
+    Detect GPU capabilities and return optimal memory settings.
+    
+    Returns:
+        dict: GPU profile with recommended settings
+    """
+    if not torch.cuda.is_available():
+        return {
+            'name': 'No GPU',
+            'total_memory_gb': 0,
+            'profile': 'cpu',
+            'memory_reserved_threshold': 4.0,
+            'memory_fraction_low': 0.8,
+            'memory_fraction_high': 0.6,
+            'block_cleanup_threshold': 0.7,
+            'io_cleanup_threshold': 0.9,
+            'recommended_blocks_to_swap': 0
+        }
+    
+    # Get GPU info
+    gpu_props = torch.cuda.get_device_properties(0)
+    total_memory_gb = gpu_props.total_memory / (1024**3)
+    gpu_name = gpu_props.name
+    
+    # Determine GPU profile based on VRAM
+    if total_memory_gb >= 24:  # High-end GPUs (RTX 4090, A100, etc.)
+        profile = {
+            'name': gpu_name,
+            'total_memory_gb': total_memory_gb,
+            'profile': 'high_end',
+            'memory_reserved_threshold': 8.0,  # Can handle more reserved memory
+            'memory_fraction_low': 0.9,  # Can use more memory
+            'memory_fraction_high': 0.8,
+            'block_cleanup_threshold': 0.85,  # Less aggressive cleanup
+            'io_cleanup_threshold': 0.95,
+            'recommended_blocks_to_swap': 0  # Usually no swap needed
+        }
+    elif total_memory_gb >= 12:  # Mid-range GPUs (RTX 3080, 4070Ti, etc.)
+        profile = {
+            'name': gpu_name,
+            'total_memory_gb': total_memory_gb,
+            'profile': 'mid_range',
+            'memory_reserved_threshold': 4.0,
+            'memory_fraction_low': 0.8,
+            'memory_fraction_high': 0.6,
+            'block_cleanup_threshold': 0.7,
+            'io_cleanup_threshold': 0.85,
+            'recommended_blocks_to_swap': 8  # Moderate swap for 7B models
+        }
+    elif total_memory_gb >= 8:  # Entry GPUs (RTX 3060, 4060, etc.)
+        profile = {
+            'name': gpu_name,
+            'total_memory_gb': total_memory_gb,
+            'profile': 'entry_level',
+            'memory_reserved_threshold': 2.0,
+            'memory_fraction_low': 0.7,
+            'memory_fraction_high': 0.5,
+            'block_cleanup_threshold': 0.6,
+            'io_cleanup_threshold': 0.8,
+            'recommended_blocks_to_swap': 16  # Aggressive swap needed
+        }
+    else:  # Low VRAM GPUs (< 8GB)
+        profile = {
+            'name': gpu_name,
+            'total_memory_gb': total_memory_gb,
+            'profile': 'low_vram',
+            'memory_reserved_threshold': 1.5,
+            'memory_fraction_low': 0.6,
+            'memory_fraction_high': 0.4,
+            'block_cleanup_threshold': 0.5,
+            'io_cleanup_threshold': 0.7,
+            'recommended_blocks_to_swap': 24  # Maximum swap
+        }
+    
+    return profile
+
+
+def get_intelligent_memory_config(model_type='3b', batch_size=5, resolution=1024) -> dict:
+    """
+    Get intelligent memory configuration based on GPU, model, and task.
+    
+    Args:
+        model_type: '3b' or '7b' model size
+        batch_size: Batch size for processing
+        resolution: Target resolution
+        
+    Returns:
+        dict: Optimized memory configuration
+    """
+    gpu_profile = get_gpu_profile()
+    
+    # Estimate memory requirements
+    if model_type == '7b':
+        base_memory_required = 14.0  # GB for 7B model
+    else:
+        base_memory_required = 8.0  # GB for 3B model
+    
+    # Adjust for batch size and resolution
+    memory_multiplier = 1.0
+    if batch_size > 5:
+        memory_multiplier += (batch_size - 5) * 0.1
+    if resolution > 1024:
+        memory_multiplier += (resolution / 1024 - 1) * 0.2
+    
+    total_required = base_memory_required * memory_multiplier
+    
+    # Determine optimal block swap based on available VRAM
+    available_vram = gpu_profile['total_memory_gb']
+    
+    if total_required > available_vram * 0.9:
+        # Need aggressive block swap
+        blocks_to_swap = min(28, int((total_required - available_vram * 0.7) / 0.5))
+    elif total_required > available_vram * 0.7:
+        # Need moderate block swap
+        blocks_to_swap = min(16, int((total_required - available_vram * 0.6) / 0.5))
+    else:
+        # No or minimal block swap needed
+        blocks_to_swap = 0
+    
+    # Override with GPU profile recommendation if lower
+    blocks_to_swap = max(blocks_to_swap, gpu_profile['recommended_blocks_to_swap'])
+    
+    return {
+        'gpu_profile': gpu_profile['profile'],
+        'gpu_name': gpu_profile['name'],
+        'total_vram_gb': gpu_profile['total_memory_gb'],
+        'blocks_to_swap': blocks_to_swap,
+        'memory_settings': {
+            'memory_reserved_threshold': gpu_profile['memory_reserved_threshold'],
+            'memory_fraction_low_reserved': gpu_profile['memory_fraction_low'],
+            'memory_fraction_high_reserved': gpu_profile['memory_fraction_high'],
+            'block_memory_cleanup_threshold': gpu_profile['block_cleanup_threshold'],
+            'io_memory_cleanup_threshold': gpu_profile['io_cleanup_threshold']
+        },
+        'estimated_memory_usage': total_required,
+        'optimization_level': 'aggressive' if blocks_to_swap > 16 else 'moderate' if blocks_to_swap > 0 else 'none'
+    }
+
+
 def release_reserved_memory() -> tuple:
     """
     Aggressively release PyTorch reserved memory.

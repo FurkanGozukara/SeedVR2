@@ -669,17 +669,31 @@ class VideoDiffusionInfer():
                     first_block = self.dit.blocks[0]
                     blocks_configured = hasattr(first_block, '_original_forward')
                 
+                # Get memory configuration from runner config if available
+                memory_config = getattr(self.config, 'seedvr2', None) if hasattr(self.config, 'seedvr2') else None
+                if memory_config:
+                    reserved_threshold = getattr(memory_config, 'memory_reserved_threshold', 4.0)
+                    fraction_low = getattr(memory_config, 'memory_fraction_low_reserved', 0.8)
+                    fraction_high = getattr(memory_config, 'memory_fraction_high_reserved', 0.6)
+                    fraction_no_swap = getattr(memory_config, 'memory_fraction_no_blockswap', 1.0)
+                else:
+                    # Fallback to defaults if config not available
+                    reserved_threshold = 4.0
+                    fraction_low = 0.8
+                    fraction_high = 0.6
+                    fraction_no_swap = 1.0
+                
                 if not blocks_configured:
                     # Block swap not properly configured, don't limit memory
-                    memory_fraction = 1.0
-                    print(f"🔍 MEMORY FIX: Block swap not configured, keeping fraction at 100%")
-                elif res_after < 4.0:  # Less than 4GB reserved
-                    memory_fraction = 0.8  # Allow up to 80% (increased from 70%)
-                    print(f"🔍 MEMORY FIX: Low reserved memory, setting fraction to 80%")
+                    memory_fraction = fraction_no_swap
+                    print(f"🔍 MEMORY FIX: Block swap not configured, keeping fraction at {memory_fraction*100:.0f}%")
+                elif res_after < reserved_threshold:
+                    memory_fraction = fraction_low
+                    print(f"🔍 MEMORY FIX: Reserved memory ({res_after:.1f}GB) < threshold ({reserved_threshold}GB), setting fraction to {memory_fraction*100:.0f}%")
                 else:
                     # More conservative when already have reservations
-                    memory_fraction = 0.6  # Allow up to 60% (increased from 50%)
-                    print(f"🔍 MEMORY FIX: Existing reservations, setting fraction to 60%")
+                    memory_fraction = fraction_high
+                    print(f"🔍 MEMORY FIX: Reserved memory ({res_after:.1f}GB) >= threshold ({reserved_threshold}GB), setting fraction to {memory_fraction*100:.0f}%")
                 
                 torch.cuda.set_per_process_memory_fraction(memory_fraction)
             
