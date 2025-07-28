@@ -40,6 +40,9 @@ class EulerSampler(Sampler):
         x: torch.Tensor,
         f: Callable[[SamplerModelArgs], torch.Tensor],
     ) -> torch.Tensor:
+        print(f"🔍 EULER SAMPLER START: Entering sample method")
+        print(f"🔍 EULER SAMPLER: x device = {x.device}, dtype = {x.dtype}")
+        
         timesteps = self.timesteps.timesteps
         progress = self.get_progress_bar()
         i = 0
@@ -58,6 +61,11 @@ class EulerSampler(Sampler):
                 t = t.half()
             if s.dtype != torch.float16:
                 s = s.half()
+            
+            # Log before first model call
+            if i == 0:
+                print(f"🔍 EULER SAMPLER: About to make first model call (iteration {i})")
+                print(f"🔍 EULER SAMPLER: Creating SamplerModelArgs with x_t device = {x.device}")
                 
             # Appel du modèle avec monitoring
             pred = f(SamplerModelArgs(x, t, i))

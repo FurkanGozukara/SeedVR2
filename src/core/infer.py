@@ -519,6 +519,18 @@ class VideoDiffusionInfer():
         # Monitoring VRAM initial et reset des pics
         #self.reset_vram_peak()
         
+        # CRITICAL: Manage memory at the start when using block swap
+        if use_blockswap and torch.cuda.is_available():
+            print(f"🔍 MEMORY INIT: Setting up memory management for block swap mode")
+            # Import memory functions
+            from src.optimization.memory_manager import release_reserved_memory
+            
+            # Release any existing reserved memory
+            release_reserved_memory()
+            
+            # NOTE: We don't set memory fraction limit here anymore to avoid OOM
+            # The block swap mechanism itself will manage memory usage
+        
         # Set cfg scale
         if cfg_scale is None:
             cfg_scale = self.config.diffusion.cfg.scale
@@ -589,36 +601,150 @@ class VideoDiffusionInfer():
                     
             # Log after VAE moved to CPU
             log_vram_usage("After VAE to CPU", "VAE offloaded, DiT ready for inference")
+            
+            # DETAILED LOGGING for blockswap detection
+            print(f"🔍 BLOCKSWAP DEBUG: use_blockswap parameter = {use_blockswap}")
+            print(f"🔍 BLOCKSWAP DEBUG: hasattr(self, '_blockswap_active') = {hasattr(self, '_blockswap_active')}")
+            if hasattr(self, "_blockswap_active"):
+                print(f"🔍 BLOCKSWAP DEBUG: self._blockswap_active = {self._blockswap_active}")
+            print(f"🔍 BLOCKSWAP DEBUG: Current DiT device = {next(self.dit.parameters()).device}")
+            
+            # Check if blocks have wrapped forward methods (indicates block swap is properly configured)
+            blocks_have_swap = False
+            if hasattr(self.dit, 'blocks') and self.dit.blocks:
+                first_block = self.dit.blocks[0]
+                blocks_have_swap = hasattr(first_block, '_original_forward')
+                print(f"🔍 BLOCKSWAP DEBUG: Blocks have swap wrapping = {blocks_have_swap}")
+            
             # Before sampling, check if BlockSwap is active
             # CRITICAL: When BlockSwap is active, DO NOT move model to GPU
             # BlockSwap will handle device placement block by block
-            if hasattr(self, "_blockswap_active") and self._blockswap_active:
+            blockswap_configured = hasattr(self, "_blockswap_active") and self._blockswap_active
+            blockswap_requested = use_blockswap and blocks_have_swap
+            blockswap_is_active = blockswap_configured or blockswap_requested
+            
+            if blockswap_is_active:
                 # BlockSwap manages device placement
+                print(f"🔄 BlockSwap active (use_blockswap={use_blockswap}, _blockswap_active={getattr(self, '_blockswap_active', False)}, blocks_have_swap={blocks_have_swap}) - skipping DiT GPU movement")
+                
+                # If blockswap was requested but not configured, warn the user
+                if use_blockswap and not blockswap_configured and not blocks_have_swap:
+                    print(f"⚠️ WARNING: use_blockswap=True but model not configured for block swap. Model will be loaded to GPU.")
+                    
                 if self.debug:
                     print(f"🔄 BlockSwap active - skipping DiT GPU movement")
-            elif not use_blockswap:
+            else:
                 # Only move to GPU if BlockSwap is definitely not active
+                print(f"🔍 BLOCKSWAP DEBUG: Moving DiT to GPU because blockswap is NOT active")
                 t = time.time()
                 self.dit = self.dit.to(get_device())
+                print(f"🔍 BLOCKSWAP DEBUG: DiT moved to {next(self.dit.parameters()).device}")
                 if self.debug:
                     print(f"🔄 Dit to GPU time: {time.time() - t} seconds")
 
         # Log VRAM before inference
         log_vram_usage("Before DiT Inference", f"Ready to run diffusion, BlockSwap: {use_blockswap}")
         
+        # CRITICAL: Release reserved memory before inference when using block swap
+        if use_blockswap and torch.cuda.is_available():
+            print(f"🔍 MEMORY FIX: Managing PyTorch memory for block swap mode")
+            
+            # Import memory manager functions
+            from src.optimization.memory_manager import release_reserved_memory
+            
+            # Use aggressive memory release
+            alloc_before, res_before, alloc_after, res_after = release_reserved_memory()
+            print(f"🔍 MEMORY FIX: Before - Allocated: {alloc_before:.2f} GB, Reserved: {res_before:.2f} GB")
+            print(f"🔍 MEMORY FIX: After - Allocated: {alloc_after:.2f} GB, Reserved: {res_after:.2f} GB")
+            
+            # Dynamic memory fraction based on current usage
+            if hasattr(torch.cuda, 'set_per_process_memory_fraction'):
+                # Calculate a reasonable fraction based on current state
+                # We want to prevent massive reservations but not limit too much
+                total_memory = torch.cuda.get_device_properties(0).total_memory / 1024**3
+                
+                # Check if blocks are properly configured for swap
+                blocks_configured = False
+                if hasattr(self.dit, 'blocks') and self.dit.blocks:
+                    first_block = self.dit.blocks[0]
+                    blocks_configured = hasattr(first_block, '_original_forward')
+                
+                if not blocks_configured:
+                    # Block swap not properly configured, don't limit memory
+                    memory_fraction = 1.0
+                    print(f"🔍 MEMORY FIX: Block swap not configured, keeping fraction at 100%")
+                elif res_after < 4.0:  # Less than 4GB reserved
+                    memory_fraction = 0.8  # Allow up to 80% (increased from 70%)
+                    print(f"🔍 MEMORY FIX: Low reserved memory, setting fraction to 80%")
+                else:
+                    # More conservative when already have reservations
+                    memory_fraction = 0.6  # Allow up to 60% (increased from 50%)
+                    print(f"🔍 MEMORY FIX: Existing reservations, setting fraction to 60%")
+                
+                torch.cuda.set_per_process_memory_fraction(memory_fraction)
+            
+            # Final cleanup
+            torch.cuda.empty_cache()
+            
+            # Log updated VRAM status
+            log_vram_usage("After Memory Release", f"Memory fraction set to {memory_fraction*100:.0f}%")
+        
+        # DETAILED LOGGING before sampler starts
+        print(f"🔍 PRE-SAMPLER DEBUG: About to start EulerSampler")
+        print(f"🔍 PRE-SAMPLER DEBUG: DiT device = {next(self.dit.parameters()).device}")
+        print(f"🔍 PRE-SAMPLER DEBUG: VAE device = {next(self.vae.parameters()).device}")
+        print(f"🔍 PRE-SAMPLER DEBUG: latents device = {latents.device}, shape = {latents.shape}, memory = {latents.element_size() * latents.nelement() / 1024**3:.3f} GB")
+        print(f"🔍 PRE-SAMPLER DEBUG: latents_cond device = {latents_cond.device}, shape = {latents_cond.shape}, memory = {latents_cond.element_size() * latents_cond.nelement() / 1024**3:.3f} GB")
+        print(f"🔍 PRE-SAMPLER DEBUG: text_pos_embeds device = {text_pos_embeds.device}, shape = {text_pos_embeds.shape}, memory = {text_pos_embeds.element_size() * text_pos_embeds.nelement() / 1024**3:.3f} GB")
+        print(f"🔍 PRE-SAMPLER DEBUG: text_neg_embeds device = {text_neg_embeds.device}, shape = {text_neg_embeds.shape}, memory = {text_neg_embeds.element_size() * text_neg_embeds.nelement() / 1024**3:.3f} GB")
+        
+        # Calculate total memory of tensors on GPU
+        total_tensor_memory = 0
+        if latents.is_cuda:
+            total_tensor_memory += latents.element_size() * latents.nelement()
+        if latents_cond.is_cuda:
+            total_tensor_memory += latents_cond.element_size() * latents_cond.nelement()
+        if text_pos_embeds.is_cuda:
+            total_tensor_memory += text_pos_embeds.element_size() * text_pos_embeds.nelement()
+        if text_neg_embeds.is_cuda:
+            total_tensor_memory += text_neg_embeds.element_size() * text_neg_embeds.nelement()
+        print(f"🔍 PRE-SAMPLER DEBUG: Total tensor memory on GPU = {total_tensor_memory / 1024**3:.3f} GB")
+        
+        print(f"🔍 PRE-SAMPLER DEBUG: Checking DiT blocks...")
+        if hasattr(self.dit, 'blocks') and self.dit.blocks:
+            print(f"🔍 PRE-SAMPLER DEBUG: First DiT block device = {next(self.dit.blocks[0].parameters()).device}")
+        
         t = time.time()
         
         with torch.autocast("cuda", target_dtype, enabled=True):
+            print(f"🔍 SAMPLER DEBUG: Inside autocast, creating sampler lambda")
+            print(f"🔍 SAMPLER DEBUG: self.dit device before sample = {next(self.dit.parameters()).device}")
+            
+            # Additional VRAM check right before sampling
+            if torch.cuda.is_available():
+                allocated_before = torch.cuda.memory_allocated() / 1024**3
+                print(f"🔍 SAMPLER DEBUG: GPU memory allocated before sample call = {allocated_before:.2f} GB")
+            
             latents = self.sampler.sample(
                 x=latents,
                 f=lambda args: classifier_free_guidance_dispatcher(
-                    pos=lambda: self.dit(
-                        vid=torch.cat([args.x_t, latents_cond], dim=-1),
-                        txt=text_pos_embeds,
-                        vid_shape=latents_shapes,
-                        txt_shape=text_pos_shapes,
-                        timestep=args.t.repeat(batch_size),
-                    ).vid_sample,
+                    pos=lambda: (
+                        print(f"🔍 DIT FORWARD: About to call self.dit() for positive prompt") or
+                        print(f"🔍 DIT FORWARD: args.x_t device = {args.x_t.device}") or
+                        print(f"🔍 DIT FORWARD: latents_cond device = {latents_cond.device}") or
+                        print(f"🔍 DIT FORWARD: GPU memory before torch.cat = {torch.cuda.memory_allocated() / 1024**3:.2f} GB") or
+                        (lambda concat_result: (
+                            print(f"🔍 DIT FORWARD: GPU memory after torch.cat = {torch.cuda.memory_allocated() / 1024**3:.2f} GB") or
+                            print(f"🔍 DIT FORWARD: concat_result shape = {concat_result.shape}, device = {concat_result.device}") or
+                            self.dit(
+                                vid=concat_result,
+                                txt=text_pos_embeds,
+                                vid_shape=latents_shapes,
+                                txt_shape=text_pos_shapes,
+                                timestep=args.t.repeat(batch_size),
+                            ).vid_sample
+                        ))(torch.cat([args.x_t, latents_cond], dim=-1))
+                    ),
                     neg=lambda: self.dit(
                         vid=torch.cat([args.x_t, latents_cond], dim=-1),
                         txt=text_neg_embeds,
@@ -731,5 +857,11 @@ class VideoDiffusionInfer():
         #torch.cuda.empty_cache()
         #print(f"🔄 FINAL CLEANUP time: {time.time() - t} seconds")
 
+        # CRITICAL: Reset memory fraction after inference completes
+        if use_blockswap and torch.cuda.is_available():
+            if hasattr(torch.cuda, 'set_per_process_memory_fraction'):
+                # Reset to default (1.0 = 100%) to avoid limiting other operations
+                torch.cuda.set_per_process_memory_fraction(1.0)
+                print(f"🔍 MEMORY RESET: Restored memory fraction to 100% after inference")
         
         return samples

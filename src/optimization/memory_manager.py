@@ -110,6 +110,47 @@ def clear_vram_cache() -> None:
         torch.cuda.empty_cache()
 
 
+def release_reserved_memory() -> tuple:
+    """
+    Aggressively release PyTorch reserved memory.
+    Returns (allocated_before, reserved_before, allocated_after, reserved_after) in GB
+    """
+    if not torch.cuda.is_available():
+        return (0, 0, 0, 0)
+    
+    # Get initial state
+    allocated_before = torch.cuda.memory_allocated() / 1024**3
+    reserved_before = torch.cuda.memory_reserved() / 1024**3
+    
+    # Step 1: Clear all caches
+    gc.collect()
+    torch.cuda.empty_cache()
+    torch.cuda.synchronize()
+    
+    # Step 2: Reset memory stats
+    torch.cuda.reset_peak_memory_stats()
+    torch.cuda.reset_accumulated_memory_stats()
+    
+    # Step 3: Force memory release by creating and deleting a small tensor
+    # This tricks PyTorch into releasing unused reserved memory
+    try:
+        dummy = torch.zeros(1, device='cuda')
+        del dummy
+    except:
+        pass
+    
+    # Step 4: Final cleanup
+    gc.collect()
+    torch.cuda.empty_cache()
+    torch.cuda.synchronize()
+    
+    # Get final state
+    allocated_after = torch.cuda.memory_allocated() / 1024**3
+    reserved_after = torch.cuda.memory_reserved() / 1024**3
+    
+    return (allocated_before, reserved_before, allocated_after, reserved_after)
+
+
 def reset_vram_peak() -> None:
     """
     Reset VRAM peak counter for new tracking

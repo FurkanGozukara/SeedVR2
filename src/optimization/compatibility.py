@@ -331,6 +331,15 @@ class FP8CompatibleDiT(torch.nn.Module):
     
     def forward(self, *args, **kwargs):
         """Forward pass with intelligent type management according to architecture"""
+        # DETAILED LOGGING for first forward call
+        if not hasattr(self, '_first_forward_logged'):
+            print(f"🔍 FP8CompatibleDiT FORWARD: First call to DiT forward")
+            print(f"🔍 FP8CompatibleDiT FORWARD: Current device = {next(self.dit_model.parameters()).device}")
+            if hasattr(self.dit_model, 'blocks') and self.dit_model.blocks:
+                print(f"🔍 FP8CompatibleDiT FORWARD: First block device = {next(self.dit_model.blocks[0].parameters()).device}")
+                print(f"🔍 FP8CompatibleDiT FORWARD: Total blocks = {len(self.dit_model.blocks)}")
+            self._first_forward_logged = True
+            
         is_nadit_7b = self._is_nadit_model()
         is_nadit_v2_3b = self._is_nadit_v2_model()
         
@@ -399,7 +408,24 @@ class FP8CompatibleDiT(torch.nn.Module):
                 kwargs = converted_kwargs
         
         try:
-            return self.dit_model(*args, **kwargs)
+            # DETAILED LOGGING before calling dit_model
+            if not hasattr(self, '_first_dit_call_logged'):
+                print(f"🔍 FP8CompatibleDiT: About to call self.dit_model forward")
+                if torch.cuda.is_available():
+                    allocated_before = torch.cuda.memory_allocated() / 1024**3
+                    print(f"🔍 FP8CompatibleDiT: GPU memory before dit_model call = {allocated_before:.2f} GB")
+                self._first_dit_call_logged = True
+                
+            result = self.dit_model(*args, **kwargs)
+            
+            # Log after first call
+            if hasattr(self, '_first_dit_call_logged') and not hasattr(self, '_first_dit_call_result_logged'):
+                if torch.cuda.is_available():
+                    allocated_after = torch.cuda.memory_allocated() / 1024**3
+                    print(f"🔍 FP8CompatibleDiT: GPU memory after dit_model call = {allocated_after:.2f} GB")
+                self._first_dit_call_result_logged = True
+                
+            return result
         except Exception as e:
             print(f"❌ Error in forward pass: {e}")
             print(f"   Model type: NaDiT 7B={is_nadit_7b}, NaDiT v2 3B={is_nadit_v2_3b}")

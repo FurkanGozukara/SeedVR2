@@ -357,6 +357,16 @@ def _wrap_block_forward(block: torch.nn.Module, block_idx: int, model: torch.nn.
             # Model has been garbage collected, fall back to original
             return original_forward(*args, **kwargs)
 
+        # DETAILED LOGGING for first forward call
+        if self._block_idx == 0 and not hasattr(self, '_first_forward_logged'):
+            print(f"🔍 BLOCKSWAP FORWARD: First call to block {self._block_idx}")
+            print(f"🔍 BLOCKSWAP FORWARD: Current device = {next(self.parameters()).device}")
+            if hasattr(model, 'blocks_to_swap'):
+                print(f"🔍 BLOCKSWAP FORWARD: blocks_to_swap = {model.blocks_to_swap}")
+                print(f"🔍 BLOCKSWAP FORWARD: main_device = {model.main_device}")
+                print(f"🔍 BLOCKSWAP FORWARD: offload_device = {model.offload_device}")
+            self._first_forward_logged = True
+
         # Check if block swap is active for this block
         if hasattr(model, 'blocks_to_swap'):
             current_device = next(self.parameters()).device
@@ -453,6 +463,14 @@ def _wrap_io_forward(module: torch.nn.Module, module_name: str, model: torch.nn.
             return self._original_forward(*args, **kwargs)
 
         t_start = time.time() if debugger and debugger.enabled else None
+        
+        # DETAILED LOGGING for first I/O forward
+        if not hasattr(self, '_first_io_forward_logged'):
+            print(f"🔍 IO SWAP DEBUG: First call to I/O component '{self._module_name}'")
+            if torch.cuda.is_available():
+                allocated_before = torch.cuda.memory_allocated() / 1024**3
+                print(f"🔍 IO SWAP DEBUG: GPU memory before '{self._module_name}' = {allocated_before:.2f} GB")
+            self._first_io_forward_logged = True
         
         # Check current device to avoid unnecessary moves
         current_device = next(self.parameters()).device
