@@ -639,6 +639,9 @@ class VideoDiffusionInfer():
                 # Only move to GPU if BlockSwap is definitely not active
                 print(f"🔍 BLOCKSWAP DEBUG: Moving DiT to GPU because blockswap is NOT active")
                 t = time.time()
+                
+                # Simply move the model to GPU - no need to clear caches
+                t = time.time()
                 self.dit = self.dit.to(get_device())
                 print(f"🔍 BLOCKSWAP DEBUG: DiT moved to {next(self.dit.parameters()).device}")
                 if self.debug:

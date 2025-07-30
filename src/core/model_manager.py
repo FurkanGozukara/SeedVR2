@@ -192,15 +192,20 @@ def configure_runner(model, base_cache_dir, preserve_vram=False, debug=False, bl
         block_swap_config and block_swap_config.get("blocks_to_swap", 0) > 0
     )
     
-    # Pre-initialize RoPE cache for optimal performance if BlockSwap is NOT active
-    if not blockswap_active:
+    # Pre-initialize RoPE cache for optimal performance only if:
+    # 1. BlockSwap is NOT active
+    # 2. preserve_vram is False (model will stay on GPU)
+    if not blockswap_active and not preserve_vram:
         t = time.time()
         preinitialize_rope_cache(runner)
         if debug:
             print(f"🔄 RUNNER : ROPE CACHE PREINITIALIZE TIME: {time.time() - t} seconds")
     else:
         if debug:
-            print(f"🔄 RUNNER : Skipping RoPE pre-init due to BlockSwap")
+            if blockswap_active:
+                print(f"🔄 RUNNER : Skipping RoPE pre-init due to BlockSwap")
+            elif preserve_vram:
+                print(f"🔄 RUNNER : Skipping RoPE pre-init due to preserve_vram (model will be on CPU)")
     
     # Apply BlockSwap if configured
     if blockswap_active:
