@@ -62,54 +62,56 @@ def configure_runner(model, base_cache_dir, preserve_vram=False, debug=False, bl
     """
 
     # Check if we can fully reuse the cached runner
-    if cached_runner and block_swap_config and block_swap_config.get("cache_model", False):        
-        # Clear RoPE caches before reuse
-        if hasattr(cached_runner, 'dit'):
-            dit_model = cached_runner.dit
-            if hasattr(dit_model, 'dit_model'):
-                dit_model = dit_model.dit_model
-            clear_rope_lru_caches(dit_model)
-        
-        print(f"♻️ Reusing cached runner for {model}")
-        
-        # Check if blockswap needs to be applied
-        blockswap_needed = block_swap_config and block_swap_config.get("blocks_to_swap", 0) > 0
-        
-        if blockswap_needed:
-            # Check if we have cached configuration
-            has_cached_config = hasattr(cached_runner, "_cached_blockswap_config")
+    if cached_runner:
+        # Check if the model name matches
+        if hasattr(cached_runner, '_model_name') and cached_runner._model_name == model:
+            # Clear RoPE caches before reuse to avoid device mismatch
+            if hasattr(cached_runner, 'dit'):
+                dit_model = cached_runner.dit
+                if hasattr(dit_model, 'dit_model'):
+                    dit_model = dit_model.dit_model
+                clear_rope_lru_caches(dit_model)
             
-            if has_cached_config:
-                # Compare configurations
-                cached_config = cached_runner._cached_blockswap_config
-                config_matches = (
-                    cached_config.get("blocks_to_swap") == block_swap_config.get("blocks_to_swap") and
-                    cached_config.get("offload_io_components") == block_swap_config.get("offload_io_components", False) and
-                    cached_config.get("use_non_blocking") == block_swap_config.get("use_non_blocking", True)
-                )
+            print(f"♻️ Reusing cached runner for {model}")
+            
+            # Check if blockswap needs to be applied
+            blockswap_needed = block_swap_config and block_swap_config.get("blocks_to_swap", 0) > 0
+            
+            if blockswap_needed:
+                # Check if we have cached configuration
+                has_cached_config = hasattr(cached_runner, "_cached_blockswap_config")
                 
-                if config_matches:
-                    # Configuration matches - fast re-application
-                    print("✅ BlockSwap config matches, performing fast re-application")
+                if has_cached_config:
+                    # Compare configurations
+                    cached_config = cached_runner._cached_blockswap_config
+                    config_matches = (
+                        cached_config.get("blocks_to_swap") == block_swap_config.get("blocks_to_swap") and
+                        cached_config.get("offload_io_components") == block_swap_config.get("offload_io_components", False) and
+                        cached_config.get("use_non_blocking") == block_swap_config.get("use_non_blocking", True)
+                    )
                     
-                    # Mark as active before applying
-                    cached_runner._blockswap_active = True
-                    
-                    # Apply BlockSwap (will be fast since model structure is intact)
-                    apply_block_swap_to_dit(cached_runner, block_swap_config)
+                    if config_matches:
+                        # Configuration matches - fast re-application
+                        print("✅ BlockSwap config matches, performing fast re-application")
+                        
+                        # Mark as active before applying
+                        cached_runner._blockswap_active = True
+                        
+                        # Apply BlockSwap (will be fast since model structure is intact)
+                        apply_block_swap_to_dit(cached_runner, block_swap_config)
+                    else:
+                        # Configuration changed - apply new config
+                        print("🔄 BlockSwap configuration changed, applying new config")
+                        apply_block_swap_to_dit(cached_runner, block_swap_config)
                 else:
-                    # Configuration changed - apply new config
-                    print("🔄 BlockSwap configuration changed, applying new config")
+                    # No cached config - apply fresh
+                    print("🔄 Applying BlockSwap to cached runner")
                     apply_block_swap_to_dit(cached_runner, block_swap_config)
-            else:
-                # No cached config - apply fresh
-                print("🔄 Applying BlockSwap to cached runner")
-                apply_block_swap_to_dit(cached_runner, block_swap_config)
             
             return cached_runner
         else:
-            # No BlockSwap needed
-            return cached_runner
+            # Model changed, need to create new runner
+            print(f"🔄 Model changed from {getattr(cached_runner, '_model_name', 'unknown')} to {model}, creating new runner")
     
     # If we reach here, create a new runner
     t = time.time()
