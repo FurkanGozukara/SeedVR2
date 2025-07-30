@@ -16,6 +16,8 @@ Key Features:
 - Advanced video format handling (4n+1 constraint)
 """
 
+# Required for VAE lifecycle management
+
 import os
 import gc
 import torch
@@ -45,6 +47,8 @@ except:
 # Get script directory for embeddings
 script_directory = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from src.common.config import create_object
+from src.core.model_manager import load_quantized_state_dict
 # Import transforms and color fix
 
 from src.data.image.transforms.divisible_crop import DivisibleCrop
@@ -344,6 +348,29 @@ def generation_loop(runner, images, cfg_scale=1.0, seed=666, res_w=720, batch_si
     try:
         # Main processing loop with context awareness
         for batch_count, batch_idx in enumerate(range(0, len(images), step)):
+            # VAE Lifecycle Management: Re-create if torn down in the previous iteration
+            # This is a robust way to prevent VRAM leaks between batches.
+            if preserve_vram and (not hasattr(runner, 'vae') or runner.vae is None):
+                print("🔧 Re-creating VAE for new batch to ensure clean VRAM state...")
+                # Re-create using the original config stored in the runner
+                runner.vae = create_object(runner.config.vae.model)
+                runner.vae.requires_grad_(False).eval()
+
+                # Get checkpoint path from stored base directory
+                base_cache_dir = getattr(runner, '_base_cache_dir', './models')
+                checkpoint_path = os.path.join(base_cache_dir, f'./{runner.config.vae.checkpoint}')
+
+                # Load state dict to CPU since preserve_vram is on
+                state = load_quantized_state_dict(checkpoint_path, "cpu", keep_native_fp8=False)
+                runner.vae.load_state_dict(state)
+                del state
+
+                # Re-apply other VAE settings
+                if hasattr(runner.vae, "set_causal_slicing") and hasattr(runner.config.vae, "slicing"):
+                    runner.vae.set_causal_slicing(**runner.config.vae.slicing)
+                if hasattr(runner.vae, "set_memory_limit"):
+                    runner.vae.set_memory_limit(**runner.config.vae.memory_limit)
+                print("✅ VAE re-created on CPU.")
             # Calculate batch indices with overlap
             if COMFYUI_AVAILABLE:
                 comfy.model_management.throw_exception_if_processing_interrupted()
@@ -499,9 +526,17 @@ def generation_loop(runner, images, cfg_scale=1.0, seed=666, res_w=720, batch_si
             if hasattr(progress_callback, '__self__') and hasattr(progress_callback.__self__, 'track_batch_time'):
                 progress_callback.__self__.track_batch_time(batch_time)
             # Clean VRAM after each batch when preserve_vram is active
-            # Modified to force cleanup even with BlockSwap for lower VRAM usage
+            # VAE Teardown: Destroy VAE object to guarantee VRAM release
             if preserve_vram:
+                print("💥 Tearing down VAE to release VRAM before next batch...")
+                if hasattr(runner, 'vae') and runner.vae is not None:
+                    # Deleting the object is the most reliable way to free memory
+                    del runner.vae
+                    runner.vae = None
+                gc.collect()
                 torch.cuda.empty_cache()
+                print("✅ VAE teardown complete.")
+
             #del transformed_video
             #clear_vram_cache()
             # Log memory state at the end of each batch
@@ -515,6 +550,12 @@ def generation_loop(runner, images, cfg_scale=1.0, seed=666, res_w=720, batch_si
         # Final cleanup of embeddings
         del text_pos_embeds
         del text_neg_embeds
+
+        # Final VAE cleanup in case loop was interrupted
+        if preserve_vram and hasattr(runner, 'vae') and runner.vae is not None:
+            del runner.vae
+            runner.vae = None
+            gc.collect()
         
         # IMPORTANT: Don't move models to CPU - this causes RAM leak!
         # The session manager will handle cleanup based on preserve_vram setting

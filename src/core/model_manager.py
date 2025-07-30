@@ -163,6 +163,8 @@ def configure_runner(model, base_cache_dir, preserve_vram=False, debug=False, bl
     runner = VideoDiffusionInfer(config, debug)
     OmegaConf.set_readonly(runner.config, False)
     # Store model name for cache validation
+    # Store base directory for potential model recreation (e.g., VAE)
+    runner._base_cache_dir = base_cache_dir
     runner._model_name = model
     if debug:
         print(f"🔄 RUNNER : RUNNER VIDEO DIFFUSION INFER TIME: {time.time() - t} seconds")
