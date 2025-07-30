@@ -513,13 +513,16 @@ def generation_loop(runner, images, cfg_scale=1.0, seed=666, res_w=720, batch_si
             debugger.log("🧹 Generation loop cleanup")
 
         # Final cleanup of embeddings
-        text_pos_embeds = text_pos_embeds.to("cpu")
-        text_neg_embeds = text_neg_embeds.to("cpu")
-        runner.dit.to("cpu")
-        runner.vae.to("cpu")
+        del text_pos_embeds
+        del text_neg_embeds
+        
+        # IMPORTANT: Don't move models to CPU - this causes RAM leak!
+        # The session manager will handle cleanup based on preserve_vram setting
+        # Only clear CUDA cache
         torch.cuda.empty_cache()
-        #del text_pos_embeds, text_neg_embeds
-        #clear_vram_cache()
+        
+        # Note: Models (runner.dit and runner.vae) should stay where they are
+        # The cleanup will be handled by the session manager
 
         # Log final memory state
         if debugger:

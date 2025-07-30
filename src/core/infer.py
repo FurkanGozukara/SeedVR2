@@ -596,9 +596,10 @@ class VideoDiffusionInfer():
             
             if conditions[0].shape[0] > 1:
                 t = time.time()
-                self.vae = self.vae.to("cpu")
+                # IMPORTANT: Don't move VAE to CPU - causes RAM leak!
+                # VAE will be used for decoding later
                 if self.debug:
-                    print(f"🔄 VAE to CPU time: {time.time() - t} seconds")
+                    print(f"🔄 Skipped VAE CPU transfer to prevent RAM leak")
                     
             # Log after VAE moved to CPU
             log_vram_usage("After VAE to CPU", "VAE offloaded, DiT ready for inference")
@@ -799,13 +800,26 @@ class VideoDiffusionInfer():
             print(f"🎯 decode_dtype: {decode_dtype}")
         if dit_vram_flag:
             t = time.time()
-            self.dit = self.dit.to("cpu")
+            # ALWAYS move DiT to CPU before VAE decode to free VRAM
+            # The session will reuse it on next run
+            if hasattr(self, 'dit') and self.dit is not None:
+                try:
+                    dit_device = next(self.dit.parameters()).device
+                    if dit_device.type == 'cuda':
+                        if self.debug:
+                            print(f"🔄 Moving DiT to CPU to free VRAM for VAE decode")
+                        self.dit = self.dit.to("cpu")
+                        torch.cuda.empty_cache()
+                except:
+                    pass
+            
+            # Clear intermediate tensors
             latents_cond = latents_cond.to("cpu")
             latents_shapes = latents_shapes.to("cpu")
             if latents[0].shape[0] > 1:
                 clear_vram_cache()
             if self.debug:
-                print(f"🔄 Dit to CPU time: {time.time() - t} seconds")
+                print(f"🔄 Cleared tensors and moved DiT in: {time.time() - t} seconds")
             
             # Extra cleanup when BlockSwap was active to defragment memory
             if hasattr(self, "_blockswap_active") and self._blockswap_active:
