@@ -242,7 +242,7 @@ class VideoDiffusionInfer():
                         # Remove the temporal dimension for VAE decode
                         frame_latent = frame_latent.squeeze(2)
                         # Decode single frame
-                        frame_sample = self.vae.decode(frame_latent, preserve_vram).sample
+                        frame_sample = self.vae.decode(frame_latent).sample
                         frame_samples.append(frame_sample)
                         # Clean up to prevent VRAM accumulation
                         if frame_idx < temporal_frames - 1:
@@ -253,7 +253,7 @@ class VideoDiffusionInfer():
                 else:
                     # Standard batch decode when not preserving VRAM
                     latent = latent.squeeze(2)
-                    sample = self.vae.decode(latent, preserve_vram).sample
+                    sample = self.vae.decode(latent).sample
                 
                 # 🚀 OPTIMISATION 4: Post-processing conditionnel
                 if hasattr(self.vae, "postprocess"):
@@ -360,7 +360,7 @@ class VideoDiffusionInfer():
                         tile_latent = latent[:, :, y:y_end, x:x_end]
                         
                         # Decode tile
-                        tile_sample = self.vae.decode(tile_latent, preserve_vram).sample
+                        tile_sample = self.vae.decode(tile_latent).sample
                         
                         # Create blend mask for smooth transitions
                         mask = self._create_tile_mask(
