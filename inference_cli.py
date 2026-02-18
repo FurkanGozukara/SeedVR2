@@ -163,14 +163,21 @@ class FFMPEGVideoWriter:
         Internally converts to RGB for ffmpeg rawvideo input.
     """
     
-    def __init__(self, path: str, width: int, height: int, fps: float, use_10bit: bool = False):
+    def __init__(self, path: str, width: int, height: int, fps: float, use_10bit: bool = False,
+                 video_codec: str = None, video_quality: int = None, video_preset: str = None):
         pix_fmt = 'yuv420p10le' if use_10bit else 'yuv420p'
-        codec = 'libx265' if use_10bit else 'libx264'
+        # User-specified codec takes priority, then 10bit flag, then default
+        if video_codec:
+            codec = video_codec
+        else:
+            codec = 'libx265' if use_10bit else 'libx264'
+        preset = video_preset or 'medium'
+        crf = str(video_quality if video_quality is not None else 12)
         
         self.proc = subprocess.Popen(
             ['ffmpeg', '-y', '-f', 'rawvideo', '-pix_fmt', 'rgb24',
              '-s', f'{width}x{height}', '-r', str(fps), '-i', '-',
-             '-c:v', codec, '-pix_fmt', pix_fmt, '-preset', 'medium', '-crf', '12', path],
+             '-c:v', codec, '-pix_fmt', pix_fmt, '-preset', preset, '-crf', crf, path],
             stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
         )
     
@@ -525,7 +532,9 @@ def process_single_file(input_path: str, args: argparse.Namespace, device_list: 
                 save_frames_to_image(result, output_path, base_name)
             else:
                 video_writer = save_frames_to_video(result, output_path, fps, 
-                    video_backend=args.video_backend, use_10bit=args.use_10bit)
+                    video_backend=args.video_backend, use_10bit=args.use_10bit,
+                    video_codec=args.video_codec, video_quality=args.video_quality,
+                    video_preset=args.video_preset)
                 if video_writer is not None:
                     video_writer.release()
             
@@ -554,7 +563,9 @@ def process_single_file(input_path: str, args: argparse.Namespace, device_list: 
                     save_frames_to_image(result, output_path, base_name, start_index=frames_written)
                 else:
                     video_writer = save_frames_to_video(result, output_path, fps, writer=video_writer,
-                        video_backend=args.video_backend, use_10bit=args.use_10bit)
+                        video_backend=args.video_backend, use_10bit=args.use_10bit,
+                        video_codec=args.video_codec, video_quality=args.video_quality,
+                        video_preset=args.video_preset)
                 
                 frames_written += result.shape[0]
                 del result
@@ -739,7 +750,10 @@ def save_frames_to_video(
     fps: float = 30.0,
     writer: Optional[cv2.VideoWriter] = None,
     video_backend: str = "opencv",
-    use_10bit: bool = False
+    use_10bit: bool = False,
+    video_codec: str = None,
+    video_quality: int = None,
+    video_preset: str = None,
 ) -> Optional[cv2.VideoWriter]:
     """
     Save frames tensor to MP4 video file.
@@ -767,7 +781,8 @@ def save_frames_to_video(
         debug.log(f"Saving {T} frames to video: {output_path} (backend={video_backend})", category="file")
         os.makedirs(Path(output_path).parent, exist_ok=True)
         if video_backend == "ffmpeg":
-            writer = FFMPEGVideoWriter(output_path, W, H, fps, use_10bit)
+            writer = FFMPEGVideoWriter(output_path, W, H, fps, use_10bit,
+                video_codec=video_codec, video_quality=video_quality, video_preset=video_preset)
         else:
             fourcc = cv2.VideoWriter_fourcc(*'mp4v')
             writer = cv2.VideoWriter(output_path, fourcc, fps, (W, H))
@@ -1356,6 +1371,14 @@ Examples:
     io_group.add_argument("--10bit", dest="use_10bit", action="store_true",
                         help="Save 10-bit video with x265 codec (reduces banding). Without this flag, "
                          "ffmpeg uses x264 for maximum compatibility. Requires --video_backend ffmpeg")
+    io_group.add_argument("--video_codec", type=str, default=None,
+                        help="Video codec for ffmpeg backend: 'libx264' (default), 'libx265'. "
+                         "Overrides --10bit codec selection. Requires --video_backend ffmpeg")
+    io_group.add_argument("--video_quality", type=int, default=None,
+                        help="CRF quality value (0-51, lower=better quality). Default: 12")
+    io_group.add_argument("--video_preset", type=str, default=None,
+                        help="Encoding preset (ultrafast, superfast, veryfast, faster, fast, medium, "
+                         "slow, slower, veryslow). Default: medium")
     io_group.add_argument("--model_dir", type=str, default=None,
                         help=f"Model directory (default: ./models/{SEEDVR2_FOLDER_NAME})")
     
