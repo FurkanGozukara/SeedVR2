@@ -163,8 +163,20 @@ class FFMPEGVideoWriter:
         Internally converts to RGB for ffmpeg rawvideo input.
     """
     
-    def __init__(self, path: str, width: int, height: int, fps: float, use_10bit: bool = False,
-                 video_codec: str = None, video_quality: int = None, video_preset: str = None):
+    def __init__(
+        self,
+        path: str,
+        width: int,
+        height: int,
+        fps: float,
+        use_10bit: bool = False,
+        video_codec: str = None,
+        video_quality: int = None,
+        video_preset: str = None,
+        h265_tune: str = "none",
+        av1_film_grain: int = 8,
+        av1_film_grain_denoise: bool = False,
+    ):
         pix_fmt = 'yuv420p10le' if use_10bit else 'yuv420p'
         # User-specified codec takes priority, then 10bit flag, then default
         if video_codec:
@@ -173,12 +185,49 @@ class FFMPEGVideoWriter:
             codec = 'libx265' if use_10bit else 'libx264'
         preset = video_preset or 'medium'
         crf = str(video_quality if video_quality is not None else 12)
-        
+        tune = str(h265_tune or "none").strip().lower()
+        if tune not in {"none", "grain", "psnr", "ssim", "fastdecode", "zerolatency", "animation"}:
+            tune = "none"
+        try:
+            film_grain = int(float(av1_film_grain))
+        except Exception:
+            film_grain = 8
+        film_grain = max(0, min(50, film_grain))
+        denoise = bool(av1_film_grain_denoise)
+
+        cmd = [
+            'ffmpeg',
+            '-y',
+            '-f',
+            'rawvideo',
+            '-pix_fmt',
+            'rgb24',
+            '-s',
+            f'{width}x{height}',
+            '-r',
+            str(fps),
+            '-i',
+            '-',
+            '-c:v',
+            codec,
+            '-pix_fmt',
+            pix_fmt,
+            '-preset',
+            preset,
+            '-crf',
+            crf,
+        ]
+        if codec == "libx265" and tune != "none":
+            cmd.extend(["-tune", tune])
+        if codec in {"libsvtav1", "libaom-av1"}:
+            cmd.extend(["-svtav1-params", f"film-grain={film_grain}:film-grain-denoise={1 if denoise else 0}"])
+        cmd.append(path)
+
         self.proc = subprocess.Popen(
-            ['ffmpeg', '-y', '-f', 'rawvideo', '-pix_fmt', 'rgb24',
-             '-s', f'{width}x{height}', '-r', str(fps), '-i', '-',
-             '-c:v', codec, '-pix_fmt', pix_fmt, '-preset', preset, '-crf', crf, path],
-            stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+            cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
         )
     
     def write(self, frame_bgr: np.ndarray):
@@ -534,7 +583,11 @@ def process_single_file(input_path: str, args: argparse.Namespace, device_list: 
                 video_writer = save_frames_to_video(result, output_path, fps, 
                     video_backend=args.video_backend, use_10bit=args.use_10bit,
                     video_codec=args.video_codec, video_quality=args.video_quality,
-                    video_preset=args.video_preset)
+                    video_preset=args.video_preset,
+                    h265_tune=args.h265_tune,
+                    av1_film_grain=args.av1_film_grain,
+                    av1_film_grain_denoise=args.av1_film_grain_denoise,
+                )
                 if video_writer is not None:
                     video_writer.release()
             
@@ -565,7 +618,11 @@ def process_single_file(input_path: str, args: argparse.Namespace, device_list: 
                     video_writer = save_frames_to_video(result, output_path, fps, writer=video_writer,
                         video_backend=args.video_backend, use_10bit=args.use_10bit,
                         video_codec=args.video_codec, video_quality=args.video_quality,
-                        video_preset=args.video_preset)
+                        video_preset=args.video_preset,
+                        h265_tune=args.h265_tune,
+                        av1_film_grain=args.av1_film_grain,
+                        av1_film_grain_denoise=args.av1_film_grain_denoise,
+                    )
                 
                 frames_written += result.shape[0]
                 del result
@@ -754,6 +811,9 @@ def save_frames_to_video(
     video_codec: str = None,
     video_quality: int = None,
     video_preset: str = None,
+    h265_tune: str = "none",
+    av1_film_grain: int = 8,
+    av1_film_grain_denoise: bool = False,
 ) -> Optional[cv2.VideoWriter]:
     """
     Save frames tensor to MP4 video file.
@@ -782,7 +842,13 @@ def save_frames_to_video(
         os.makedirs(Path(output_path).parent, exist_ok=True)
         if video_backend == "ffmpeg":
             writer = FFMPEGVideoWriter(output_path, W, H, fps, use_10bit,
-                video_codec=video_codec, video_quality=video_quality, video_preset=video_preset)
+                video_codec=video_codec,
+                video_quality=video_quality,
+                video_preset=video_preset,
+                h265_tune=h265_tune,
+                av1_film_grain=av1_film_grain,
+                av1_film_grain_denoise=av1_film_grain_denoise,
+            )
         else:
             fourcc = cv2.VideoWriter_fourcc(*'mp4v')
             writer = cv2.VideoWriter(output_path, fourcc, fps, (W, H))
@@ -1372,13 +1438,19 @@ Examples:
                         help="Save 10-bit video with x265 codec (reduces banding). Without this flag, "
                          "ffmpeg uses x264 for maximum compatibility. Requires --video_backend ffmpeg")
     io_group.add_argument("--video_codec", type=str, default=None,
-                        help="Video codec for ffmpeg backend: 'libx264' (default), 'libx265'. "
+                        help="Video codec for ffmpeg backend: 'libx264' (default), 'libx265', or 'libsvtav1'. "
                          "Overrides --10bit codec selection. Requires --video_backend ffmpeg")
     io_group.add_argument("--video_quality", type=int, default=None,
                         help="CRF quality value (0-51, lower=better quality). Default: 12")
     io_group.add_argument("--video_preset", type=str, default=None,
                         help="Encoding preset (ultrafast, superfast, veryfast, faster, fast, medium, "
                          "slow, slower, veryslow). Default: medium")
+    io_group.add_argument("--h265_tune", type=str, default="none",
+                        help="Optional x265 tune for H.265 encoding (none, grain, psnr, ssim, fastdecode, zerolatency, animation)")
+    io_group.add_argument("--av1_film_grain", type=int, default=8,
+                        help="SVT-AV1 film-grain strength (0-50). Default: 8")
+    io_group.add_argument("--av1_film_grain_denoise", type=int, default=0, choices=[0, 1],
+                        help="SVT-AV1 film-grain-denoise flag (0 or 1). Default: 0")
     io_group.add_argument("--model_dir", type=str, default=None,
                         help=f"Model directory (default: ./models/{SEEDVR2_FOLDER_NAME})")
     
@@ -1536,6 +1608,16 @@ def main() -> None:
     """
     # Parse arguments
     args = parse_arguments()
+
+    args.h265_tune = str(args.h265_tune or "none").strip().lower() or "none"
+    if args.h265_tune not in {"none", "grain", "psnr", "ssim", "fastdecode", "zerolatency", "animation"}:
+        args.h265_tune = "none"
+    try:
+        args.av1_film_grain = int(args.av1_film_grain)
+    except Exception:
+        args.av1_film_grain = 8
+    args.av1_film_grain = max(0, min(50, int(args.av1_film_grain)))
+    args.av1_film_grain_denoise = bool(int(args.av1_film_grain_denoise))
 
     # Update debug instance with --debug flag
     debug.enabled = args.debug
