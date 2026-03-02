@@ -139,6 +139,71 @@ debug = Debug(enabled=False)  # Will be enabled via --debug CLI flag
 # FFMPEG Class
 # =============================================================================
 
+
+_UNSUPPORTED_NUMPY_DTYPES = tuple(
+    dt for dt in (
+        getattr(torch, "bfloat16", None),
+        getattr(torch, "float8_e4m3fn", None),
+        getattr(torch, "float8_e5m2", None),
+    ) if dt is not None
+)
+
+
+def _requires_numpy_compatible_cast(dtype: torch.dtype) -> bool:
+    """
+    Return True when torch->numpy direct conversion is not supported for this dtype.
+    """
+    return dtype in _UNSUPPORTED_NUMPY_DTYPES
+
+
+def _estimate_frame_conversion_batch_size(frames_tensor: torch.Tensor, target_mb: int = 256) -> int:
+    """
+    Choose a bounded frame-conversion batch size so dtype conversion stays memory-safe.
+    """
+    if frames_tensor.ndim != 4:
+        return 1
+
+    _, h, w, c = frames_tensor.shape
+    bytes_per_frame_float32 = int(h) * int(w) * int(c) * 4
+    if bytes_per_frame_float32 <= 0:
+        return 1
+
+    target_bytes = max(32, int(target_mb)) * 1024 * 1024
+    return max(1, target_bytes // bytes_per_frame_float32)
+
+
+def _iter_uint8_frames(
+    frames_tensor: torch.Tensor,
+    conversion_batch_size: Optional[int] = None
+) -> Generator[np.ndarray, None, None]:
+    """
+    Yield uint8 RGB(A) frames from [T,H,W,C] tensor without allocating a full video numpy copy.
+    """
+    if frames_tensor.ndim != 4:
+        raise ValueError(f"Expected frames tensor with shape [T,H,W,C], got {tuple(frames_tensor.shape)}")
+
+    total = int(frames_tensor.shape[0])
+    if total == 0:
+        return
+
+    if conversion_batch_size is None or conversion_batch_size <= 0:
+        conversion_batch_size = _estimate_frame_conversion_batch_size(frames_tensor)
+    conversion_batch_size = max(1, min(int(conversion_batch_size), total))
+
+    for start in range(0, total, conversion_batch_size):
+        end = min(start + conversion_batch_size, total)
+        batch = frames_tensor[start:end]
+
+        # Move only the active slice to CPU, then convert dtype only when numpy cannot represent it.
+        if batch.is_cuda or batch.is_mps:
+            batch = batch.cpu()
+        if _requires_numpy_compatible_cast(batch.dtype):
+            batch = batch.to(torch.float32)
+
+        batch_u8 = (batch.clamp(0.0, 1.0) * 255.0).to(torch.uint8)
+        for frame in batch_u8.numpy():
+            yield frame
+
 class FFMPEGVideoWriter:
     """
     Video writer using ffmpeg subprocess for encoding with 10-bit support.
@@ -655,7 +720,7 @@ def process_single_file(input_path: str, args: argparse.Namespace, device_list: 
     
     # Save single image
     os.makedirs(Path(output_path).parent, exist_ok=True)
-    frame_np = (result[0].cpu().numpy() * 255.0).astype(np.uint8)
+    frame_np = next(_iter_uint8_frames(result[0:1], conversion_batch_size=1))
     _save_image_bgr(frame_np, output_path)
     
     debug.log(f"Output saved to: {output_path}", category="file", force=True)
@@ -823,7 +888,7 @@ def save_frames_to_video(
     an existing writer is passed and kept open for subsequent chunks.
     
     Args:
-        frames_tensor: Frames in format [T, H, W, C], Float32, range [0,1]
+        frames_tensor: Frames in format [T, H, W, C], floating-point, range [0,1]
         output_path: Output video file path (directory created if doesn't exist)
         fps: Frames per second for output video (default: 30.0)
         writer: Existing VideoWriter for streaming (if None, creates new one)
@@ -834,8 +899,10 @@ def save_frames_to_video(
     Raises:
         ValueError: If video writer cannot be initialized
     """
-    frames_np = (frames_tensor.cpu().numpy() * 255.0).astype(np.uint8)
-    T, H, W, C = frames_np.shape
+    if frames_tensor.ndim != 4:
+        raise ValueError(f"Expected frames tensor [T,H,W,C], got {tuple(frames_tensor.shape)}")
+
+    T, H, W, C = [int(v) for v in frames_tensor.shape]
     
     if writer is None:
         debug.log(f"Saving {T} frames to video: {output_path} (backend={video_backend})", category="file")
@@ -855,11 +922,14 @@ def save_frames_to_video(
         if not writer.isOpened():
             raise ValueError(f"Cannot create video writer for: {output_path}")
     
-    for i, frame in enumerate(frames_np):
-        frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+    for i, frame in enumerate(_iter_uint8_frames(frames_tensor), start=1):
+        if C == 4:
+            frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGBA2BGR)
+        else:
+            frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
         writer.write(frame_bgr)
-        if debug.enabled and (i + 1) % 100 == 0:
-            debug.log(f"Written {i + 1}/{T} frames", category="file")
+        if debug.enabled and i % 100 == 0:
+            debug.log(f"Written {i}/{T} frames", category="file")
     
     return writer  # Caller always closes
 
@@ -877,7 +947,7 @@ def save_frames_to_image(
     Converts Float32 [0,1] to uint8 [0,255] and RGB(A) to BGR(A) for OpenCV.
     
     Args:
-        frames_tensor: Frames in format [T, H, W, C], Float32, range [0,1]
+        frames_tensor: Frames in format [T, H, W, C], floating-point, range [0,1]
         output_dir: Directory to save PNG files (created if doesn't exist)
         base_name: Base name for output files (e.g., "frame" → "frame_00000.png")
         start_index: Starting index for filenames (for streaming continuation)
@@ -887,14 +957,16 @@ def save_frames_to_image(
     """
     os.makedirs(output_dir, exist_ok=True)
     
-    frames_np = (frames_tensor.cpu().numpy() * 255.0).astype(np.uint8)
-    total = frames_np.shape[0]
+    if frames_tensor.ndim != 4:
+        raise ValueError(f"Expected frames tensor [T,H,W,C], got {tuple(frames_tensor.shape)}")
+
+    total = int(frames_tensor.shape[0])
     
     if start_index == 0:
         debug.log(f"Saving {total} frames as PNGs to directory: {output_dir}", category="file")
     digits = 6  # Supports up to 999,999 frames (~11.5 hours at 24fps)
 
-    for idx, frame in enumerate(frames_np):
+    for idx, frame in enumerate(_iter_uint8_frames(frames_tensor)):
         filename = f"{base_name}_{start_index + idx:0{digits}d}.png"
         file_path = os.path.join(output_dir, filename)
         _save_image_bgr(frame, file_path)
@@ -930,7 +1002,7 @@ def _process_frames_core(
         runner_cache: Optional cache dict for model reuse (direct mode only)
     
     Returns:
-        Upscaled frames tensor [T', H', W', C], Float32, range [0,1]
+        Upscaled frames tensor [T', H', W', C], floating-point, range [0,1]
     """    
     # Determine platform and convert device IDs to full names
     platform_type = get_gpu_backend()
@@ -1084,11 +1156,9 @@ def _process_frames_core(
     
     result_tensor = ctx['final_video']
     
-    # Convert to CPU and compatible dtype
+    # Move to CPU for downstream save/IPC paths.
     if result_tensor.is_cuda or result_tensor.is_mps:
         result_tensor = result_tensor.cpu()
-    if result_tensor.dtype in (torch.bfloat16, torch.float8_e4m3fn, torch.float8_e5m2):
-        result_tensor = result_tensor.to(torch.float32)
     
     return result_tensor
 
@@ -1177,6 +1247,10 @@ def _worker_process(
             runner_cache=None
         )
     
+    # NumPy IPC path does not support bfloat16/float8; keep memory pressure low with float16.
+    if _requires_numpy_compatible_cast(result_tensor.dtype):
+        result_tensor = result_tensor.to(torch.float16)
+
     # Share tensor memory for efficient cross-process transfer (avoids pickling large arrays)
     return_queue.put((proc_idx, result_tensor.share_memory_()))
     
@@ -1228,7 +1302,7 @@ def _gpu_processing(
                    for streaming mode where workers read video directly
     
     Returns:
-        Upscaled frames tensor [T', H', W', C], Float32, range [0,1]
+        Upscaled frames tensor [T', H', W', C], floating-point, range [0,1]
     """
     num_devices = len(device_list)
     overlap = args.temporal_overlap
@@ -1325,7 +1399,7 @@ def _gpu_processing(
         result_tensor = None
         
         for idx, res_np in enumerate(results_np):
-            chunk_tensor = torch.from_numpy(res_np).to(torch.float32)
+            chunk_tensor = torch.from_numpy(res_np)
             
             if idx == 0:
                 # First chunk: keep all frames
@@ -1352,10 +1426,10 @@ def _gpu_processing(
                         result_tensor = torch.cat([result_tensor, chunk_tensor[overlap:]], dim=0)
         
         if result_tensor is None:
-            result_tensor = torch.from_numpy(results_np[0]).to(torch.float32)
+            result_tensor = torch.from_numpy(results_np[0])
     else:
         # Simple concatenation without overlap
-        result_tensor = torch.from_numpy(np.concatenate(results_np, axis=0)).to(torch.float32)
+        result_tensor = torch.from_numpy(np.concatenate(results_np, axis=0))
 
     # Handle prepend_frames removal (multi-GPU safe - done after all workers complete)
     if args.prepend_frames > 0:
