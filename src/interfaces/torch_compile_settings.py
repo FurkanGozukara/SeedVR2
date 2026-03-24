@@ -50,12 +50,14 @@ class SeedVR2TorchCompileSettings(io.ComfyNode):
                         "• True: Enforce no breaks for maximum optimization (may fail with dynamic shapes)"
                     )
                 ),
-                io.Boolean.Input("dynamic",
-                    default=False,
+                io.Combo.Input("dynamic",
+                    options=["none", "false", "true"],
+                    default="none",
                     tooltip=(
-                        "Handle varying input shapes without recompilation.\n"
-                        "• False: Specialize for exact input shapes (default)\n"
-                        "• True: Create dynamic kernels that adapt to shape variations\n"
+                        "Handle varying input shapes during compilation.\n"
+                        "• none: PyTorch auto mode (recommended default)\n"
+                        "• false: Specialize for exact input shapes\n"
+                        "• true: Create dynamic kernels up front\n"
                         "\n"
                         "Enable when processing different resolutions or batch sizes."
                     )
@@ -94,7 +96,7 @@ class SeedVR2TorchCompileSettings(io.ComfyNode):
         )
     
     @classmethod
-    def execute(cls, backend: str, mode: str, fullgraph: bool, dynamic: bool, 
+    def execute(cls, backend: str, mode: str, fullgraph: bool, dynamic: str,
                    dynamo_cache_size_limit: int, dynamo_recompile_limit: int) -> io.NodeOutput:
         """
         Create torch.compile configuration for model optimization
@@ -103,18 +105,26 @@ class SeedVR2TorchCompileSettings(io.ComfyNode):
             backend: Compilation backend ("inductor" or "cudagraphs")
             mode: Optimization mode ("default", "reduce-overhead", "max-autotune", etc.)
             fullgraph: Whether to compile entire model as single graph
-            dynamic: Whether to handle varying input shapes without recompilation
+            dynamic: Dynamic-shape mode ("none", "false", or "true")
             dynamo_cache_size_limit: Maximum cached compiled versions per function
             dynamo_recompile_limit: Maximum recompilation attempts before fallback
             
         Returns:
             NodeOutput containing torch.compile configuration dictionary
         """
+        dynamic_text = str(dynamic or "none").strip().lower()
+        if dynamic_text in {"", "none", "auto", "default"}:
+            dynamic_value = None
+        elif dynamic_text in {"true", "1", "yes", "on"}:
+            dynamic_value = True
+        else:
+            dynamic_value = False
+
         compile_args = {
             "backend": backend,
             "mode": mode,
             "fullgraph": fullgraph,
-            "dynamic": dynamic,
+            "dynamic": dynamic_value,
             "dynamo_cache_size_limit": dynamo_cache_size_limit,
             "dynamo_recompile_limit": dynamo_recompile_limit,
         }

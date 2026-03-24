@@ -1456,10 +1456,9 @@ class VideoAutoencoderKL(diffusers.AutoencoderKL):
                 result[:, :, : encoded_tile.shape[2], y_lat : y_lat + eff_h_lat, x_lat : x_lat + eff_w_lat] += encoded_tile
                 count[:, :, :, y_lat : y_lat + eff_h_lat, x_lat : x_lat + eff_w_lat].addcmul_(weight_h_5d, weight_w_5d)
 
-        # Move result back to inference device if needed and normalize
-        if result.device != x.device:
-            result = result.to(x.device)
-            count = count.to(x.device)
+        # Normalize on the accumulation device. Moving the full stitched tensor
+        # back to the inference device defeats tensor_offload_device and can
+        # create large transient VRAM spikes at the end of tiled VAE passes.
         result.div_(count.clamp(min=1e-6))
 
         if x.shape[2] == 1:  # single frame
@@ -1618,10 +1617,9 @@ class VideoAutoencoderKL(diffusers.AutoencoderKL):
                 result[:, :, : decoded_tile.shape[2], y_out:y_out_end, x_out:x_out_end] += decoded_tile
                 count[:, :, :, y_out:y_out_end, x_out:x_out_end].addcmul_(weight_h_5d, weight_w_5d)
 
-        # Move result back to inference device if needed and normalize
-        if result.device != z.device:
-            result = result.to(z.device)
-            count = count.to(z.device)
+        # Normalize on the accumulation device. Moving the full stitched tensor
+        # back to the inference device defeats tensor_offload_device and can
+        # create large transient VRAM spikes at the end of tiled VAE passes.
         result.div_(count.clamp(min=1e-6)) # In-place normalize
 
         if z.shape[2] == 1:  # single frame

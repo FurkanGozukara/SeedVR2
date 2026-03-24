@@ -123,9 +123,9 @@ class SeedVR2VideoUpscaler(io.ComfyNode):
                     )
                 ),
                 io.Boolean.Input("uniform_batch_size",
-                    default=False,
+                    default=True,
                     tooltip=(
-                        "Pad final batch to match batch_size (default: False).\n"
+                        "Pad final batch to match batch_size (default: True).\n"
                         "Prevents temporal artifacts caused by small final batch.\n"
                         "Add extra compute but recommended for optimal quality."
                     )
@@ -226,7 +226,7 @@ class SeedVR2VideoUpscaler(io.ComfyNode):
     @classmethod
     def execute(cls, image: torch.Tensor, dit: Dict[str, Any], vae: Dict[str, Any], 
                 seed: int, resolution: int = 1080, max_resolution: int = 0, batch_size: int = 5,
-                uniform_batch_size: bool = False, temporal_overlap: int = 0, prepend_frames: int = 0,
+                uniform_batch_size: bool = True, temporal_overlap: int = 0, prepend_frames: int = 0,
                 color_correction: str = "wavelet", input_noise_scale: float = 0.0,
                 latent_noise_scale: float = 0.0, offload_device: str = "none", 
                 enable_debug: bool = False) -> io.NodeOutput:

@@ -24,6 +24,7 @@ Key Features:
 """
 
 import os
+import time
 import torch
 from typing import Dict, List, Optional, Tuple, Any, Callable
 
@@ -47,6 +48,7 @@ from ..optimization.memory_manager import (
     cleanup_dit,
     cleanup_vae,
     cleanup_text_embeddings,
+    clear_memory,
     manage_tensor,
     manage_model_device,
     release_tensor_memory,
@@ -64,6 +66,35 @@ from ..utils.color_fix import (
     wavelet_reconstruction,
     adaptive_instance_normalization
 )
+
+
+def _format_seconds_per_iteration(duration_seconds: float) -> str:
+    """Format a single-iteration duration using tqdm-style `s/it` wording."""
+    try:
+        duration = max(0.0, float(duration_seconds))
+    except Exception:
+        duration = 0.0
+    return f"{duration:.2f}s/it"
+
+
+def _log_batch_iteration_speed(
+    debug: Optional['Debug'],
+    phase_label: str,
+    batch_number: int,
+    total_batches: int,
+    duration_seconds: float,
+    *,
+    indent_level: int = 1,
+) -> None:
+    """Emit a compact per-batch speed line for phases that do not use tqdm."""
+    if debug is None:
+        return
+    debug.log(
+        f"{phase_label} batch {batch_number}/{total_batches} speed: {_format_seconds_per_iteration(duration_seconds)}",
+        category="timing",
+        force=True,
+        indent_level=indent_level,
+    )
 
 
 def _prepare_video_batch(
@@ -360,6 +391,7 @@ def encode_all_batches(
             is_uniform_padding = uniform_batch_size and current_frames < batch_size
             
             debug.log(f"Encoding batch {encode_idx+1}/{num_encode_batches}", category="vae", force=True)
+            encode_started_at = time.perf_counter()
             debug.start_timer(f"encode_batch_{encode_idx+1}")
             
             # Save original length before any padding
@@ -517,6 +549,13 @@ def encode_all_batches(
             del cond_latents
             
             debug.end_timer(f"encode_batch_{encode_idx+1}", f"Encoded batch {encode_idx+1}")
+            _log_batch_iteration_speed(
+                debug,
+                "Encoding",
+                encode_idx + 1,
+                num_encode_batches,
+                time.perf_counter() - encode_started_at,
+            )
             
             if progress_callback:
                 progress_callback(encode_idx+1, num_encode_batches, 
@@ -528,10 +567,37 @@ def encode_all_batches(
         debug.log(f"Error in Phase 1 (Encoding): {e}", level="ERROR", category="error", force=True)
         raise
     finally:
+        compiled_vae_active = bool(getattr(runner, '_vae_compile_args', None))
+
         # Offload VAE to configured offload device if specified
         if ctx['vae_offload_device'] is not None:
             manage_model_device(model=runner.vae, target_device=ctx['vae_offload_device'], 
                                 model_name="VAE", debug=debug, reason="VAE offload", runner=runner)
+
+        # Compiled VAE can leave allocator/workspace state reserved after encode/offload.
+        # Flush caches at the phase boundary so DiT upscaling does not inherit that baseline.
+        if compiled_vae_active:
+            debug.log(
+                "Compiled VAE detected - forcing boundary memory cleanup before DiT upscaling",
+                category="cleanup",
+                force=True,
+            )
+            clear_memory(
+                debug=debug,
+                deep=True,
+                force=True,
+                timer_name="phase1_compiled_vae_boundary_cleanup",
+            )
+            if hasattr(torch._C, '_cuda_clearCublasWorkspaces'):
+                try:
+                    torch._C._cuda_clearCublasWorkspaces()
+                except Exception as workspace_err:
+                    debug.log(
+                        f"Failed to clear cuBLAS workspaces after compiled VAE cleanup: {workspace_err}",
+                        level="WARNING",
+                        category="memory",
+                        force=True,
+                    )
     
     debug.end_timer("phase1_encoding", "Phase 1: VAE encoding complete", show_breakdown=True)
     debug.log_memory_state("After phase 1 (VAE encoding)", show_tensors=False)
@@ -761,6 +827,8 @@ def upscale_all_batches(
         debug.log(f"Error in Phase 2 (Upscaling): {e}", level="ERROR", category="error", force=True)
         raise
     finally:
+        compiled_dit_active = bool(getattr(runner, '_dit_compile_args', None))
+
         # Log BlockSwap summary if it was used
         if hasattr(runner, '_blockswap_active') and runner._blockswap_active:
             swap_summary = debug.get_swap_summary()
@@ -797,6 +865,31 @@ def upscale_all_batches(
         
         # Cleanup text embeddings as they're no longer needed after upscaling
         cleanup_text_embeddings(ctx, debug)
+
+        # Compiled DiT can leave allocator/workspace state reserved after model deletion.
+        # Flush caches at the phase boundary so VAE decode starts from a clean VRAM baseline.
+        if compiled_dit_active:
+            debug.log(
+                "Compiled DiT detected - forcing boundary memory cleanup before VAE decoding",
+                category="cleanup",
+                force=True,
+            )
+            clear_memory(
+                debug=debug,
+                deep=True,
+                force=True,
+                timer_name="phase2_compiled_dit_boundary_cleanup",
+            )
+            if hasattr(torch._C, '_cuda_clearCublasWorkspaces'):
+                try:
+                    torch._C._cuda_clearCublasWorkspaces()
+                except Exception as workspace_err:
+                    debug.log(
+                        f"Failed to clear cuBLAS workspaces after compiled DiT cleanup: {workspace_err}",
+                        level="WARNING",
+                        category="memory",
+                        force=True,
+                    )
     
     debug.end_timer("phase2_upscaling", "Phase 2: DiT upscaling complete", show_breakdown=True)
     debug.log_memory_state("After phase 2 (DiT upscaling)", show_tensors=False)
@@ -919,6 +1012,7 @@ def decode_all_batches(
             check_interrupt(ctx)
             
             debug.log(f"Decoding batch {decode_idx+1}/{num_valid_latents}", category="vae", force=True)
+            decode_started_at = time.perf_counter()
             debug.start_timer(f"decode_batch_{decode_idx+1}")
             
             # Move to VAE device with correct dtype for decoding (no-op if already there)
@@ -1029,6 +1123,13 @@ def decode_all_batches(
             del upscaled_latent, sample
             
             debug.end_timer(f"decode_batch_{decode_idx+1}", f"Decoded batch {decode_idx+1}")
+            _log_batch_iteration_speed(
+                debug,
+                "Decoding",
+                decode_idx + 1,
+                num_valid_latents,
+                time.perf_counter() - decode_started_at,
+            )
             
             if progress_callback:
                 progress_callback(decode_idx+1, num_valid_latents,
@@ -1161,6 +1262,7 @@ def postprocess_all_batches(
                     continue
                 
                 debug.log(f"Processing Alpha batch {batch_idx+1}/{num_valid_samples}", category="alpha", force=True)
+                alpha_started_at = time.perf_counter()
                 debug.start_timer(f"alpha_batch_{batch_idx+1}")
 
                 # Get RGB slice from final_video for alpha processing
@@ -1207,6 +1309,13 @@ def postprocess_all_batches(
                 ctx['all_input_rgb'][batch_idx] = None
             
                 debug.end_timer(f"alpha_batch_{batch_idx+1}", f"Alpha batch {batch_idx+1}")
+                _log_batch_iteration_speed(
+                    debug,
+                    "Alpha",
+                    batch_idx + 1,
+                    num_valid_samples,
+                    time.perf_counter() - alpha_started_at,
+                )
                 
                 # Update progress for alpha processing step
                 current_postprocessing_step += 1
@@ -1222,6 +1331,7 @@ def postprocess_all_batches(
             check_interrupt(ctx)
             
             debug.log(f"Post-processing batch {info_idx+1}/{num_valid_samples}", category="video", force=True)
+            postprocess_started_at = time.perf_counter()
             debug.start_timer(f"postprocess_batch_{info_idx+1}")
             
             # Get slice from final_video - currently in [T, H, W, C] format, values in [-1, 1]
@@ -1376,6 +1486,13 @@ def postprocess_all_batches(
             del sample, sample_thwc
             
             debug.end_timer(f"postprocess_batch_{info_idx+1}", f"Post-processed batch {info_idx+1}")
+            _log_batch_iteration_speed(
+                debug,
+                "Post-processing",
+                info_idx + 1,
+                num_valid_samples,
+                time.perf_counter() - postprocess_started_at,
+            )
             
             # Update progress for main processing step
             current_postprocessing_step += 1

@@ -48,8 +48,10 @@ import sys
 import os
 import argparse
 import time
+import signal
 import platform
 import multiprocessing as mp
+import tempfile
 from typing import Dict, Any, List, Optional, Tuple, Literal, Generator
 from datetime import datetime
 from pathlib import Path
@@ -117,6 +119,7 @@ from src.utils.model_registry import get_available_dit_models, DEFAULT_DIT, DEFA
 from src.utils.constants import SEEDVR2_FOLDER_NAME
 from src.core.generation_utils import (
     setup_generation_context, 
+    setup_video_transform,
     prepare_runner, 
     compute_generation_info, 
     log_generation_start,
@@ -133,6 +136,11 @@ from src.core.generation_phases import (
 from src.utils.debug import Debug
 from src.optimization.memory_manager import clear_memory, get_gpu_backend, is_cuda_available
 debug = Debug(enabled=False)  # Will be enabled via --debug CLI flag
+
+
+_SPLIT_PHASE_REQUEST_KIND = "seedvr2_split_phase_request_v1"
+_SPLIT_PHASE_STATE_KIND = "seedvr2_split_phase_state_v1"
+_SPLIT_PHASE_STAGES = ("encode", "upscale", "decode")
 
 
 # =============================================================================
@@ -978,50 +986,211 @@ def save_frames_to_image(
 
 
 # =============================================================================
-# Core Processing Logic
+# Split-Phase Helpers
 # =============================================================================
 
-def _process_frames_core(
-    frames_tensor: torch.Tensor,
+def _normalize_compile_dynamic_mode(value: Any) -> Optional[bool]:
+    """Normalize CLI/UI dynamic-shape setting to torch.compile's tri-state input."""
+    if value is None:
+        return None
+
+    value_text = str(value).strip().lower()
+    if value_text in {"", "none", "auto", "default"}:
+        return None
+    if value_text in {"true", "1", "yes", "on"}:
+        return True
+    if value_text in {"false", "0", "no", "off"}:
+        return False
+    return None
+
+
+def _clone_tensor_to_cpu_for_ipc(tensor: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+    """Detach and move tensors to CPU so stage hand-off is pickle-safe across platforms."""
+    if tensor is None:
+        return None
+    if not isinstance(tensor, torch.Tensor):
+        raise TypeError(f"Expected torch.Tensor or None, got {type(tensor)!r}")
+
+    out = tensor.detach()
+    if out.is_cuda or out.is_mps:
+        out = out.cpu()
+    else:
+        out = out.cpu()
+    return out.contiguous()
+
+
+def _clone_tensor_list_to_cpu_for_ipc(values: Optional[List[Optional[torch.Tensor]]]) -> Optional[List[Optional[torch.Tensor]]]:
+    if values is None:
+        return None
+    return [_clone_tensor_to_cpu_for_ipc(item) if isinstance(item, torch.Tensor) else None for item in values]
+
+
+def _save_split_blob(path: Path, kind: str, payload: Dict[str, Any]) -> None:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save({"kind": kind, "payload": payload}, str(path))
+
+
+def _load_split_blob(path: Path, expected_kind: str) -> Dict[str, Any]:
+    blob = torch.load(str(path), map_location="cpu", weights_only=False)
+    if not isinstance(blob, dict):
+        raise RuntimeError(f"Split-phase blob at {path} is malformed")
+    if str(blob.get("kind") or "") != expected_kind:
+        raise RuntimeError(
+            f"Split-phase blob at {path} has kind {blob.get('kind')!r}, expected {expected_kind!r}"
+        )
+    payload = blob.get("payload")
+    if not isinstance(payload, dict):
+        raise RuntimeError(f"Split-phase blob at {path} is missing a payload dict")
+    return payload
+
+
+def _save_split_phase_state(path: Path, phase: str, data: Dict[str, Any]) -> None:
+    _save_split_blob(path, _SPLIT_PHASE_STATE_KIND, {"phase": phase, "data": data})
+
+
+def _load_split_phase_state(path: Path, expected_phase: Optional[str] = None) -> Dict[str, Any]:
+    payload = _load_split_blob(path, _SPLIT_PHASE_STATE_KIND)
+    phase = str(payload.get("phase") or "")
+    if expected_phase is not None and phase != expected_phase:
+        raise RuntimeError(
+            f"Split-phase state at {path} has phase {phase!r}, expected {expected_phase!r}"
+        )
+    data = payload.get("data")
+    if not isinstance(data, dict):
+        raise RuntimeError(f"Split-phase state at {path} is missing a data payload")
+    return data
+
+
+def _build_split_phase_request(args: argparse.Namespace, device_id: str) -> Dict[str, Any]:
+    request_args = dict(vars(args))
+    request_args["cache_dit"] = False
+    request_args["cache_vae"] = False
+    request_args["split_phase_subprocesses"] = False
+    request_args["_phase_stage"] = None
+    request_args["_phase_request"] = None
+    request_args["_phase_state_in"] = None
+    request_args["_phase_state_out"] = None
+    for path_key in ("input", "output", "model_dir", "resume_run_dir"):
+        path_value = request_args.get(path_key)
+        if isinstance(path_value, str) and path_value.strip():
+            request_args[path_key] = str(Path(path_value).resolve())
+    return {
+        "args": request_args,
+        "device_id": str(device_id),
+        "cwd": str(Path.cwd()),
+    }
+
+
+def _stream_child_process_output(proc: subprocess.Popen) -> None:
+    if proc.stdout is None:
+        return
+    for line in proc.stdout:
+        print(line.rstrip("\r\n"), flush=True)
+
+
+def _linux_set_parent_death_signal() -> None:
+    """Ensure internal child stages terminate if the parent CLI process dies on Linux."""
+    if platform.system() != "Linux":
+        return
+    try:
+        import ctypes
+        try:
+            libc = ctypes.CDLL("libc.so.6")
+        except OSError:
+            libc = ctypes.CDLL(None)
+        pr_set_pdeathsig = 1
+        libc.prctl(pr_set_pdeathsig, signal.SIGTERM)
+    except Exception:
+        pass
+
+
+def _run_split_phase_subprocess(
+    *,
+    stage: str,
+    args: argparse.Namespace,
+    device_id: str,
+    request_path: Path,
+    state_in_path: Path,
+    state_out_path: Path,
+    debug: Debug,
+) -> None:
+    cli_script = Path(__file__).resolve()
+    launch_cwd = Path.cwd()
+    child_env = os.environ.copy()
+    child_env.setdefault("PYTHONIOENCODING", "utf-8")
+    cmd = [
+        sys.executable,
+        str(cli_script),
+        str(getattr(args, "input", "") or cli_script.name),
+        "--_phase_stage",
+        str(stage),
+        "--_phase_request",
+        str(request_path),
+        "--_phase_state_in",
+        str(state_in_path),
+        "--_phase_state_out",
+        str(state_out_path),
+    ]
+    if platform.system() != "Darwin" and str(device_id or "").strip():
+        cmd.extend(["--cuda_device", str(device_id)])
+
+    debug.log(
+        f"Launching isolated phase subprocess: {stage}",
+        category="generation",
+        force=True,
+    )
+
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        bufsize=1,
+        cwd=str(launch_cwd),
+        env=child_env,
+        preexec_fn=_linux_set_parent_death_signal if platform.system() == "Linux" else None,
+    )
+    _stream_child_process_output(proc)
+    return_code = proc.wait()
+    if return_code != 0:
+        raise RuntimeError(f"SeedVR2 split-phase subprocess '{stage}' failed with exit code {return_code}")
+    if not state_out_path.exists():
+        raise RuntimeError(f"SeedVR2 split-phase subprocess '{stage}' did not produce {state_out_path}")
+
+
+def _create_processing_runtime(
     args: argparse.Namespace,
     device_id: str,
     debug: Debug,
-    runner_cache: Optional[Dict[str, Any]] = None
-) -> torch.Tensor:
-    """
-    Core frame processing logic shared between worker and direct processing.
-    
-    Executes the complete 4-phase pipeline: encode → upscale → decode → postprocess.
-    Supports both cached (direct) and non-cached (worker) execution modes.
-    
-    Args:
-        frames_tensor: Input frames [T, H, W, C], Float16/Float32, range [0,1]
-        args: Command-line arguments with all processing settings
-        device_id: Device ID for inference ("0", "1", etc.)
-        debug: Debug instance for logging
-        runner_cache: Optional cache dict for model reuse (direct mode only)
-    
-    Returns:
-        Upscaled frames tensor [T', H', W', C], floating-point, range [0,1]
-    """    
-    # Determine platform and convert device IDs to full names
+    runner_cache: Optional[Dict[str, Any]] = None,
+    *,
+    allow_model_cache: bool = True,
+    preload_text_embeddings: bool = False,
+) -> Tuple["VideoDiffusionInfer", Dict[str, Any], bool, bool]:
+    """Build a fresh processing runtime or reuse cached state for the single-process path."""
     platform_type = get_gpu_backend()
     inference_device = _device_id_to_name(device_id, platform_type)
-    
-    # Parse offload devices (with caching defaults)
-    cache_dit = args.cache_dit if runner_cache is not None else False
-    cache_vae = args.cache_vae if runner_cache is not None else False
-    
+
+    cache_dit = bool(getattr(args, "cache_dit", False)) if (allow_model_cache and runner_cache is not None) else False
+    cache_vae = bool(getattr(args, "cache_vae", False)) if (allow_model_cache and runner_cache is not None) else False
+
     dit_offload = _parse_offload_device(args.dit_offload_device, platform_type, cache_dit)
     vae_offload = _parse_offload_device(args.vae_offload_device, platform_type, cache_vae)
     tensor_offload = _parse_offload_device(args.tensor_offload_device, platform_type, False)
-    
-    # Setup or reuse generation context
-    if runner_cache is not None and 'ctx' in runner_cache:
+
+    if allow_model_cache and runner_cache is not None and 'ctx' in runner_cache:
         ctx = runner_cache['ctx']
-        # Clear previous run data but keep device config
-        keys_to_keep = {'dit_device', 'vae_device', 'dit_offload_device', 
-                       'vae_offload_device', 'tensor_offload_device', 'compute_dtype'}
+        keys_to_keep = {
+            'dit_device',
+            'vae_device',
+            'dit_offload_device',
+            'vae_offload_device',
+            'tensor_offload_device',
+            'compute_dtype',
+        }
         for key in list(ctx.keys()):
             if key not in keys_to_keep:
                 del ctx[key]
@@ -1034,38 +1203,35 @@ def _process_frames_core(
             tensor_offload_device=tensor_offload,
             debug=debug
         )
-        if runner_cache is not None:
+        if allow_model_cache and runner_cache is not None:
             runner_cache['ctx'] = ctx
-    
-    # Build torch compile args
+
+    compile_dynamic_mode = _normalize_compile_dynamic_mode(getattr(args, "compile_dynamic", None))
     torch_compile_args_dit = None
     torch_compile_args_vae = None
-    if args.compile_dit:
+    if getattr(args, "compile_dit", False):
         torch_compile_args_dit = {
             "backend": args.compile_backend,
             "mode": args.compile_mode,
             "fullgraph": args.compile_fullgraph,
-            "dynamic": args.compile_dynamic,
+            "dynamic": compile_dynamic_mode,
             "dynamo_cache_size_limit": args.compile_dynamo_cache_size_limit,
             "dynamo_recompile_limit": args.compile_dynamo_recompile_limit,
         }
-    if args.compile_vae:
+    if getattr(args, "compile_vae", False):
         torch_compile_args_vae = {
             "backend": args.compile_backend,
             "mode": args.compile_mode,
             "fullgraph": args.compile_fullgraph,
-            "dynamic": args.compile_dynamic,
+            "dynamic": compile_dynamic_mode,
             "dynamo_cache_size_limit": args.compile_dynamo_cache_size_limit,
             "dynamo_recompile_limit": args.compile_dynamo_recompile_limit,
         }
-    
-    # Prepare runner with caching support
+
     model_dir = args.model_dir if args.model_dir is not None else f"./models/{SEEDVR2_FOLDER_NAME}"
-    
-    # Use fixed IDs for CLI caching when enabled
     dit_id = "cli_dit" if cache_dit else None
     vae_id = "cli_vae" if cache_vae else None
-    
+
     runner, cache_context = prepare_runner(
         dit_model=args.dit_model,
         vae_model=DEFAULT_VAE,
@@ -1092,14 +1258,338 @@ def _process_frames_core(
         torch_compile_args_dit=torch_compile_args_dit,
         torch_compile_args_vae=torch_compile_args_vae
     )
-    
+
     ctx['cache_context'] = cache_context
-    if runner_cache is not None:
+    if allow_model_cache and runner_cache is not None:
         runner_cache['runner'] = runner
+
+    if preload_text_embeddings:
+        ctx['text_embeds'] = load_text_embeddings(
+            script_directory,
+            ctx['dit_device'],
+            ctx['compute_dtype'],
+            debug,
+        )
+        debug.log("Loaded text embeddings for DiT", category="dit")
+
+    return runner, ctx, cache_dit, cache_vae
+
+
+def _serialize_encode_stage_state(ctx: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "input_images": _clone_tensor_to_cpu_for_ipc(ctx.get("input_images")),
+        "all_latents": _clone_tensor_list_to_cpu_for_ipc(ctx.get("all_latents")),
+        "all_ori_lengths": list(ctx.get("all_ori_lengths") or []),
+        "batch_metadata": list(ctx.get("batch_metadata") or []) if isinstance(ctx.get("batch_metadata"), list) else None,
+        "all_alpha_channels": _clone_tensor_list_to_cpu_for_ipc(ctx.get("all_alpha_channels")),
+        "all_input_rgb": _clone_tensor_list_to_cpu_for_ipc(ctx.get("all_input_rgb")),
+        "true_target_dims": tuple(ctx.get("true_target_dims")) if ctx.get("true_target_dims") is not None else None,
+        "total_frames": int(ctx.get("total_frames") or 0),
+        "actual_temporal_overlap": int(ctx.get("actual_temporal_overlap") or 0),
+        "is_rgba": bool(ctx.get("is_rgba", False)),
+    }
+
+
+def _serialize_upscale_stage_state(ctx: Dict[str, Any]) -> Dict[str, Any]:
+    payload = _serialize_encode_stage_state(ctx)
+    payload.pop("all_latents", None)
+    payload["all_upscaled_latents"] = _clone_tensor_list_to_cpu_for_ipc(ctx.get("all_upscaled_latents"))
+    return payload
+
+
+def _restore_common_stage_state(
+    ctx: Dict[str, Any],
+    payload: Dict[str, Any],
+    args: argparse.Namespace,
+) -> None:
+    ctx["input_images"] = _clone_tensor_to_cpu_for_ipc(payload.get("input_images"))
+    ctx["all_ori_lengths"] = list(payload.get("all_ori_lengths") or [])
+    ctx["batch_metadata"] = list(payload.get("batch_metadata") or []) if isinstance(payload.get("batch_metadata"), list) else None
+    ctx["all_alpha_channels"] = _clone_tensor_list_to_cpu_for_ipc(payload.get("all_alpha_channels"))
+    ctx["all_input_rgb"] = _clone_tensor_list_to_cpu_for_ipc(payload.get("all_input_rgb"))
+    ctx["total_frames"] = int(payload.get("total_frames") or 0)
+    ctx["actual_temporal_overlap"] = int(payload.get("actual_temporal_overlap") or 0)
+    ctx["is_rgba"] = bool(payload.get("is_rgba", False))
+
+    input_images = ctx.get("input_images")
+    if isinstance(input_images, torch.Tensor) and input_images.ndim >= 4 and input_images.shape[0] > 0:
+        sample_frame = input_images[0].permute(2, 0, 1).unsqueeze(0)
+        setup_video_transform(ctx, args.resolution, args.max_resolution, debug=None, sample_frame=sample_frame)
+        del sample_frame
+
+    true_target_dims = payload.get("true_target_dims")
+    if isinstance(true_target_dims, (list, tuple)) and len(true_target_dims) == 2:
+        ctx["true_target_dims"] = (int(true_target_dims[0]), int(true_target_dims[1]))
+
+
+def _run_split_encode_stage(
+    args: argparse.Namespace,
+    device_id: str,
+    state_in_path: Path,
+    state_out_path: Path,
+    debug: Debug,
+) -> None:
+    payload = _load_split_phase_state(state_in_path, expected_phase="input_frames")
+    frames_tensor = payload.get("frames_tensor")
+    if not isinstance(frames_tensor, torch.Tensor):
+        raise RuntimeError("Split encode stage did not receive a valid frames tensor")
+
+    runner, ctx, _cache_dit, _cache_vae = _create_processing_runtime(
+        args,
+        device_id,
+        debug,
+        runner_cache=None,
+        allow_model_cache=False,
+        preload_text_embeddings=False,
+    )
+
+    frames_tensor, gen_info = compute_generation_info(
+        ctx=ctx,
+        images=frames_tensor,
+        resolution=args.resolution,
+        max_resolution=args.max_resolution,
+        batch_size=args.batch_size,
+        uniform_batch_size=args.uniform_batch_size,
+        seed=args.seed,
+        prepend_frames=args.prepend_frames,
+        temporal_overlap=args.temporal_overlap,
+        debug=debug
+    )
+    log_generation_start(gen_info, debug)
+
+    ctx = encode_all_batches(
+        runner,
+        ctx=ctx,
+        images=frames_tensor,
+        debug=debug,
+        batch_size=args.batch_size,
+        uniform_batch_size=args.uniform_batch_size,
+        seed=args.seed,
+        progress_callback=None,
+        temporal_overlap=args.temporal_overlap,
+        resolution=args.resolution,
+        max_resolution=args.max_resolution,
+        input_noise_scale=args.input_noise_scale,
+        color_correction=args.color_correction,
+    )
+    _save_split_phase_state(state_out_path, "encoded", _serialize_encode_stage_state(ctx))
+
+
+def _run_split_upscale_stage(
+    args: argparse.Namespace,
+    device_id: str,
+    state_in_path: Path,
+    state_out_path: Path,
+    debug: Debug,
+) -> None:
+    payload = _load_split_phase_state(state_in_path, expected_phase="encoded")
+
+    runner, ctx, _cache_dit, _cache_vae = _create_processing_runtime(
+        args,
+        device_id,
+        debug,
+        runner_cache=None,
+        allow_model_cache=False,
+        preload_text_embeddings=True,
+    )
+    _restore_common_stage_state(ctx, payload, args)
+    ctx["all_latents"] = _clone_tensor_list_to_cpu_for_ipc(payload.get("all_latents")) or []
+
+    ctx = upscale_all_batches(
+        runner,
+        ctx=ctx,
+        debug=debug,
+        progress_callback=None,
+        seed=args.seed,
+        latent_noise_scale=args.latent_noise_scale,
+        cache_model=False,
+    )
+    _save_split_phase_state(state_out_path, "upscaled", _serialize_upscale_stage_state(ctx))
+
+
+def _run_split_decode_stage(
+    args: argparse.Namespace,
+    device_id: str,
+    state_in_path: Path,
+    state_out_path: Path,
+    debug: Debug,
+) -> None:
+    payload = _load_split_phase_state(state_in_path, expected_phase="upscaled")
+
+    runner, ctx, _cache_dit, _cache_vae = _create_processing_runtime(
+        args,
+        device_id,
+        debug,
+        runner_cache=None,
+        allow_model_cache=False,
+        preload_text_embeddings=False,
+    )
+    _restore_common_stage_state(ctx, payload, args)
+    ctx["all_upscaled_latents"] = _clone_tensor_list_to_cpu_for_ipc(payload.get("all_upscaled_latents")) or []
+
+    ctx = decode_all_batches(
+        runner,
+        ctx=ctx,
+        debug=debug,
+        progress_callback=None,
+        cache_model=False,
+    )
+    ctx = postprocess_all_batches(
+        ctx=ctx,
+        debug=debug,
+        progress_callback=None,
+        color_correction=args.color_correction,
+        prepend_frames=0,
+        temporal_overlap=args.temporal_overlap,
+        batch_size=args.batch_size,
+    )
+
+    result_tensor = ctx.get("final_video")
+    if not isinstance(result_tensor, torch.Tensor):
+        raise RuntimeError("Split decode stage did not produce a final tensor")
+    result_tensor = _clone_tensor_to_cpu_for_ipc(result_tensor)
+    _save_split_phase_state(state_out_path, "decoded_final", {"result_tensor": result_tensor})
+
+
+def _run_split_phase_pipeline(
+    frames_tensor: torch.Tensor,
+    args: argparse.Namespace,
+    device_id: str,
+    debug: Debug,
+) -> torch.Tensor:
+    if getattr(args, "cache_dit", False) or getattr(args, "cache_vae", False):
+        debug.log(
+            "Split-phase subprocess mode disables model caching so each heavy phase gets a fresh process and CUDA context",
+            category="cache",
+            force=True,
+        )
+
+    with tempfile.TemporaryDirectory(prefix="seedvr2_phase_split_") as temp_dir_str:
+        temp_dir = Path(temp_dir_str)
+        request_path = temp_dir / "phase_request.pt"
+        encode_input_path = temp_dir / "phase_input.pt"
+        encode_output_path = temp_dir / "phase_encoded.pt"
+        upscale_output_path = temp_dir / "phase_upscaled.pt"
+        decode_output_path = temp_dir / "phase_decoded.pt"
+
+        _save_split_blob(
+            request_path,
+            _SPLIT_PHASE_REQUEST_KIND,
+            _build_split_phase_request(args, device_id),
+        )
+        _save_split_phase_state(
+            encode_input_path,
+            "input_frames",
+            {"frames_tensor": _clone_tensor_to_cpu_for_ipc(frames_tensor)},
+        )
+
+        _run_split_phase_subprocess(
+            stage="encode",
+            args=args,
+            device_id=device_id,
+            request_path=request_path,
+            state_in_path=encode_input_path,
+            state_out_path=encode_output_path,
+            debug=debug,
+        )
+        encode_input_path.unlink(missing_ok=True)
+
+        _run_split_phase_subprocess(
+            stage="upscale",
+            args=args,
+            device_id=device_id,
+            request_path=request_path,
+            state_in_path=encode_output_path,
+            state_out_path=upscale_output_path,
+            debug=debug,
+        )
+        encode_output_path.unlink(missing_ok=True)
+
+        _run_split_phase_subprocess(
+            stage="decode",
+            args=args,
+            device_id=device_id,
+            request_path=request_path,
+            state_in_path=upscale_output_path,
+            state_out_path=decode_output_path,
+            debug=debug,
+        )
+        upscale_output_path.unlink(missing_ok=True)
+
+        result_payload = _load_split_phase_state(decode_output_path, expected_phase="decoded_final")
+        result_tensor = result_payload.get("result_tensor")
+        if not isinstance(result_tensor, torch.Tensor):
+            raise RuntimeError("Split-phase decode subprocess did not return a tensor")
+        if result_tensor.is_cuda or result_tensor.is_mps:
+            result_tensor = result_tensor.cpu()
+        return result_tensor
+
+
+def _run_internal_split_phase(parsed_args: argparse.Namespace) -> None:
+    request_payload = _load_split_blob(Path(parsed_args._phase_request), _SPLIT_PHASE_REQUEST_KIND)
+    request_args = request_payload.get("args")
+    if not isinstance(request_args, dict):
+        raise RuntimeError("Split-phase request payload is missing serialized args")
+
+    args = argparse.Namespace(**request_args)
+    args.split_phase_subprocesses = False
+    debug.enabled = bool(getattr(args, "debug", False))
+
+    device_id = str(request_payload.get("device_id") or "0")
+    stage = str(parsed_args._phase_stage or "").strip().lower()
+    state_in_path = Path(parsed_args._phase_state_in)
+    state_out_path = Path(parsed_args._phase_state_out)
+
+    debug.log(f"Internal split-phase subprocess started: {stage}", category="generation", force=True)
+
+    if stage == "encode":
+        _run_split_encode_stage(args, device_id, state_in_path, state_out_path, debug)
+    elif stage == "upscale":
+        _run_split_upscale_stage(args, device_id, state_in_path, state_out_path, debug)
+    elif stage == "decode":
+        _run_split_decode_stage(args, device_id, state_in_path, state_out_path, debug)
+    else:
+        raise RuntimeError(f"Unknown split-phase subprocess stage: {stage!r}")
+
+
+# =============================================================================
+# Core Processing Logic
+# =============================================================================
+
+def _process_frames_core(
+    frames_tensor: torch.Tensor,
+    args: argparse.Namespace,
+    device_id: str,
+    debug: Debug,
+    runner_cache: Optional[Dict[str, Any]] = None
+) -> torch.Tensor:
+    """
+    Core frame processing logic shared between worker and direct processing.
     
-    # Preload text embeddings before Phase 1 to avoid sync stall in Phase 2
-    ctx['text_embeds'] = load_text_embeddings(script_directory, ctx['dit_device'], ctx['compute_dtype'], debug)
-    debug.log("Loaded text embeddings for DiT", category="dit")
+    Executes the complete 4-phase pipeline: encode → upscale → decode → postprocess.
+    Supports both cached (direct) and non-cached (worker) execution modes.
+    
+    Args:
+        frames_tensor: Input frames [T, H, W, C], Float16/Float32, range [0,1]
+        args: Command-line arguments with all processing settings
+        device_id: Device ID for inference ("0", "1", etc.)
+        debug: Debug instance for logging
+        runner_cache: Optional cache dict for model reuse (direct mode only)
+    
+    Returns:
+        Upscaled frames tensor [T', H', W', C], floating-point, range [0,1]
+    """
+    if getattr(args, "split_phase_subprocesses", False):
+        return _run_split_phase_pipeline(frames_tensor, args, device_id, debug)
+
+    runner, ctx, cache_dit, cache_vae = _create_processing_runtime(
+        args,
+        device_id,
+        debug,
+        runner_cache=runner_cache,
+        allow_model_cache=True,
+        preload_text_embeddings=True,
+    )
     
     # Compute generation info and log start (handles prepending internally)
     frames_tensor, gen_info = compute_generation_info(
@@ -1628,12 +2118,15 @@ Examples:
                         "'max-autotune-no-cudagraphs' (like max-autotune without cudagraphs) (default: default)")
     perf_group.add_argument("--compile_fullgraph", action="store_true",
                         help="Compile entire model as single graph (faster but less flexible). May fail with dynamic shapes (default: False)")
-    perf_group.add_argument("--compile_dynamic", action="store_true",
-                        help="Handle varying input shapes without recompilation. Useful for different resolutions/batch sizes (default: False)")
+    perf_group.add_argument("--compile_dynamic", type=str.lower, nargs="?", const="true", default="none",
+                        choices=["none", "false", "true"],
+                        help="Dynamic-shape mode: 'none' (PyTorch auto, recommended), 'false' (exact-shape specialization), or 'true' (dynamic kernels up front). Bare --compile_dynamic is treated as 'true' (default: none)")
     perf_group.add_argument("--compile_dynamo_cache_size_limit", type=int, default=64,
                         help="Max cached compiled versions per function. Increase when using many different input shapes. Higher uses more memory (default: 64)")
     perf_group.add_argument("--compile_dynamo_recompile_limit", type=int, default=128,
                         help="Max recompilation attempts before fallback to eager mode. Safety limit to prevent compilation loops (default: 128)")
+    perf_group.add_argument("--split_phase_subprocesses", action="store_true",
+                        help="Run VAE encode, DiT upscale, and VAE decode/postprocess in separate subprocesses for stronger phase-boundary VRAM cleanup. Slower, but reduces cross-phase allocator residue.")
     
     # Model Caching (for batch processing)
     cache_group = parser.add_argument_group('Model caching (batch processing)')
@@ -1648,6 +2141,12 @@ Examples:
     debug_group = parser.add_argument_group('Debugging')
     debug_group.add_argument("--debug", action="store_true",
                         help="Enable verbose debug logging")
+
+    # Internal split-phase orchestration (hidden)
+    parser.add_argument("--_phase_stage", type=str, choices=list(_SPLIT_PHASE_STAGES), default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--_phase_request", type=str, default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--_phase_state_in", type=str, default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--_phase_state_out", type=str, default=None, help=argparse.SUPPRESS)
     
     # Auto-show help if no arguments provided
     if len(sys.argv) == 1:
@@ -1681,7 +2180,20 @@ def main() -> None:
         SystemExit: On argument validation failure or processing error
     """
     # Parse arguments
-    args = parse_arguments()
+    parsed_args = parse_arguments()
+    is_internal_split_phase = bool(parsed_args._phase_stage)
+    args = parsed_args
+
+    if is_internal_split_phase:
+        request_payload = _load_split_blob(Path(parsed_args._phase_request), _SPLIT_PHASE_REQUEST_KIND)
+        request_args = request_payload.get("args")
+        if not isinstance(request_args, dict):
+            raise RuntimeError("Split-phase request payload is missing serialized args")
+        args = argparse.Namespace(**request_args)
+        args._phase_stage = parsed_args._phase_stage
+        args._phase_request = parsed_args._phase_request
+        args._phase_state_in = parsed_args._phase_state_in
+        args._phase_state_out = parsed_args._phase_state_out
 
     args.h265_tune = str(args.h265_tune or "none").strip().lower() or "none"
     if args.h265_tune not in {"none", "grain", "psnr", "ssim", "fastdecode", "zerolatency", "animation"}:
@@ -1696,12 +2208,13 @@ def main() -> None:
     # Update debug instance with --debug flag
     debug.enabled = args.debug
 
-    # print header
-    debug.print_header(cli=True)
-    
-    debug.log("Arguments:", category="setup")
-    for key, value in vars(args).items():
-        debug.log(f"{key}: {value}", category="none", indent_level=1)
+    if not is_internal_split_phase:
+        debug.print_header(cli=True)
+        debug.log("Arguments:", category="setup")
+        for key, value in vars(args).items():
+            debug.log(f"{key}: {value}", category="none", indent_level=1)
+    else:
+        debug.log(f"Split-phase child stage: {args._phase_stage}", category="generation", force=True)
 
     if args.vae_encode_tiled and args.vae_encode_tile_overlap >= args.vae_encode_tile_size:
         debug.log(f"VAE encode tile overlap ({args.vae_encode_tile_overlap}) must be smaller than tile size ({args.vae_encode_tile_size})", level="ERROR", category="vae", force=True)
@@ -1716,6 +2229,10 @@ def main() -> None:
         debug.log("--video_backend ffmpeg requires ffmpeg in PATH. Install ffmpeg or use --video_backend opencv", 
                  level="ERROR", category="setup", force=True)
         sys.exit(1)
+
+    if is_internal_split_phase:
+        _run_internal_split_phase(args)
+        return
     
     # Inform about caching defaults
     if args.cache_dit and args.dit_offload_device == "none":
@@ -1733,6 +2250,16 @@ def main() -> None:
             "Set --vae_offload_device explicitly to use a different device.",
             category="cache", force=True
         )
+
+    if args.split_phase_subprocesses and (args.cache_dit or args.cache_vae):
+        debug.log(
+            "split_phase_subprocesses is enabled; DiT/VAE cache flags will be ignored so each heavy phase uses a fresh subprocess.",
+            level="WARNING",
+            category="cache",
+            force=True,
+        )
+        args.cache_dit = False
+        args.cache_vae = False
 
     if args.debug:
         if platform.system() == "Darwin":

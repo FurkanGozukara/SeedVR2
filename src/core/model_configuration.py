@@ -143,6 +143,7 @@ def _describe_compile_config(config: Optional[Dict[str, Any]]) -> str:
     # Core parameters
     mode = config.get("mode", "default")
     backend = config.get("backend", "inductor")
+    dynamic_mode = _normalize_compile_dynamic_mode(config.get("dynamic", None))
     
     parts = [f"{mode} mode"]
     
@@ -151,8 +152,12 @@ def _describe_compile_config(config: Optional[Dict[str, Any]]) -> str:
         parts.append(f"{backend} backend")
     if config.get("fullgraph", False):
         parts.append("fullgraph")
-    if config.get("dynamic", False):
+    if dynamic_mode is None:
+        parts.append("dynamic=auto")
+    elif dynamic_mode:
         parts.append("dynamic")
+    else:
+        parts.append("static-shapes")
     
     # Dynamo tuning parameters (show if non-default)
     cache_limit = config.get("dynamo_cache_size_limit", 64)
@@ -164,6 +169,25 @@ def _describe_compile_config(config: Optional[Dict[str, Any]]) -> str:
         parts.append(f"recompile_limit={recompile_limit}")
     
     return f"enabled ({', '.join(parts)})"
+
+
+def _normalize_compile_dynamic_mode(value: Any) -> Optional[bool]:
+    """Normalize compile dynamic mode to None / False / True."""
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+
+    text = str(value).strip().lower()
+    if text in {"", "none", "auto", "default"}:
+        return None
+    if text in {"true", "1", "yes", "on"}:
+        return True
+    if text in {"false", "0", "no", "off"}:
+        return False
+    return None
 
 
 def _describe_attention_mode(attention_mode: Optional[str]) -> str:
@@ -1308,7 +1332,7 @@ def _configure_torch_compile(compile_args: Dict[str, Any], model_type: str,
         'backend': compile_args.get('backend', 'inductor'),
         'mode': compile_args.get('mode', 'default'),
         'fullgraph': compile_args.get('fullgraph', False),
-        'dynamic': compile_args.get('dynamic', False)
+        'dynamic': _normalize_compile_dynamic_mode(compile_args.get('dynamic', None))
     }
     
     dynamo_cache_size_limit = compile_args.get('dynamo_cache_size_limit', 64)
