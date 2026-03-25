@@ -52,6 +52,7 @@ import signal
 import platform
 import multiprocessing as mp
 import tempfile
+import re
 from typing import Dict, Any, List, Optional, Tuple, Literal, Generator
 from datetime import datetime
 from pathlib import Path
@@ -402,13 +403,37 @@ VIDEO_EXTENSIONS = {'.mp4', '.avi', '.mov', '.mkv', '.webm', '.flv', '.wmv', '.m
 IMAGE_EXTENSIONS = {'.png', '.jpg', '.jpeg', '.bmp', '.tiff', '.tif', '.webp'}
 
 
+def logical_filename_sort_key(value: str) -> Tuple[Tuple[int, object], ...]:
+    """
+    Deterministic Windows-style logical filename sort key used on every OS.
+    """
+    name = Path(str(value or "")).name.casefold()
+    parts = re.split(r"(\d+)", name)
+    return tuple(
+        (0, int(part)) if part.isdigit() else (1, part)
+        for part in parts
+        if part != ""
+    )
+
+
+def _logical_sort_paths(paths: List[Path]) -> List[Path]:
+    return sorted(
+        list(paths or []),
+        key=lambda value: (
+            logical_filename_sort_key(str(value)),
+            str(value).casefold(),
+            str(value),
+        ),
+    )
+
+
 # =============================================================================
 # Video I/O Functions
 # =============================================================================
 
 def get_media_files(directory: str) -> List[str]:
     """
-    Get all video and image files from directory, sorted alphabetically.
+    Get all video and image files from directory, sorted with logical filename order.
     
     Args:
         directory: Path to directory to scan
@@ -422,7 +447,98 @@ def get_media_files(directory: str) -> List[str]:
     # Get all files and filter by extension (case-insensitive)
     files = [f for f in path.iterdir() if f.is_file() and f.suffix.lower() in valid_extensions]
     
-    return sorted([str(f) for f in files])
+    return [str(f) for f in _logical_sort_paths(files)]
+
+
+def get_image_sequence_files(directory: str) -> List[str]:
+    """
+    Get all image files from a directory, sorted with logical filename order.
+    """
+    path = Path(directory)
+    files = [f for f in path.iterdir() if f.is_file() and f.suffix.lower() in IMAGE_EXTENSIONS]
+    return [str(f) for f in _logical_sort_paths(files)]
+
+
+def _read_sequence_image(image_path: str) -> np.ndarray:
+    """
+    Read one sequence frame and convert to RGB/RGBA float32 [0,1].
+    """
+    frame = cv2.imread(str(image_path), cv2.IMREAD_UNCHANGED)
+    if frame is None:
+        raise ValueError(f"Cannot open image frame: {image_path}")
+
+    if frame.ndim == 2:
+        frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2RGB)
+    elif frame.shape[2] == 4:
+        frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2RGBA)
+    else:
+        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
+    return frame.astype(np.float32) / 255.0
+
+
+def _apply_frame_limits(frame_paths: List[str], skip_first_frames: int, load_cap: int) -> List[str]:
+    selected = list(frame_paths or [])
+    if skip_first_frames > 0:
+        selected = selected[int(skip_first_frames):]
+    if load_cap > 0:
+        selected = selected[: int(load_cap)]
+    return selected
+
+
+def _read_frames_from_paths(frame_paths: List[str]) -> Optional[torch.Tensor]:
+    """
+    Read an ordered list of image paths into a [T,H,W,C] float tensor.
+    """
+    if not frame_paths:
+        return None
+
+    frames: List[np.ndarray] = []
+    reference_shape: Optional[Tuple[int, ...]] = None
+
+    for frame_path in frame_paths:
+        frame = _read_sequence_image(frame_path)
+        if reference_shape is None:
+            reference_shape = tuple(frame.shape)
+        elif tuple(frame.shape) != reference_shape:
+            raise ValueError(
+                f"Image sequence frame shape mismatch: expected {reference_shape}, "
+                f"got {tuple(frame.shape)} in {frame_path}"
+            )
+        frames.append(frame)
+
+    if not frames:
+        return None
+
+    return torch.from_numpy(np.stack(frames)).to(torch.float32)
+
+
+def extract_frames_from_directory(
+    directory: str,
+    skip_first_frames: int = 0,
+    load_cap: int = 0,
+) -> Tuple[torch.Tensor, float]:
+    """
+    Load a frame-sequence directory as a temporal clip.
+    """
+    frame_paths = get_image_sequence_files(directory)
+    if not frame_paths:
+        raise ValueError(f"No supported image frames found in directory: {directory}")
+
+    frame_paths = _apply_frame_limits(frame_paths, skip_first_frames, load_cap)
+    if not frame_paths:
+        raise ValueError("No frames remain after applying skip_first_frames/load_cap.")
+
+    frames_tensor = _read_frames_from_paths(frame_paths)
+    if frames_tensor is None:
+        raise ValueError(f"Failed to load image sequence: {directory}")
+
+    debug.log(
+        f"Image sequence info: {frames_tensor.shape[0]} frames, "
+        f"{frames_tensor.shape[2]}x{frames_tensor.shape[1]}, assumed 30.00 FPS",
+        category="info",
+    )
+    return frames_tensor.to(torch.float16), 30.0
 
 
 def extract_frames_from_image(image_path: str) -> Tuple[torch.Tensor, float]:
@@ -519,6 +635,15 @@ def generate_output_path(input_path: str, output_format: str, output_dir: Option
     """
     input_path_obj = Path(input_path)
     input_name = input_path_obj.stem
+
+    if output_dir:
+        requested_output = Path(output_dir)
+        if requested_output.suffix:
+            suffix = requested_output.suffix.lower()
+            if output_format == "mp4" and suffix in VIDEO_EXTENSIONS:
+                return str(requested_output.resolve())
+            if output_format == "png" and input_type == "image" and suffix in IMAGE_EXTENSIONS:
+                return str(requested_output.resolve())
     
     # Determine base directory and whether to add suffix
     if output_dir:
@@ -543,7 +668,14 @@ def generate_output_path(input_path: str, output_format: str, output_dir: Option
         if input_type == "image":
             output_path = base_dir / f"{input_name}{file_suffix}.png"
         else:
-            output_path = base_dir / f"{input_name}{file_suffix}"
+            if output_dir:
+                requested_dir = Path(output_dir)
+                if requested_dir.suffix == "" and requested_dir.name.casefold() == input_name.casefold():
+                    output_path = requested_dir
+                else:
+                    output_path = base_dir / f"{input_name}{file_suffix}"
+            else:
+                output_path = base_dir / f"{input_name}{file_suffix}"
     else:
         output_path = base_dir / f"{input_name}{file_suffix}.mp4"
     
@@ -554,7 +686,7 @@ def process_single_file(input_path: str, args: argparse.Namespace, device_list: 
                        output_path: Optional[str] = None, format_auto_detected: bool = False,
                        runner_cache: Optional[Dict[str, Any]] = None) -> int:
     """
-    Process a single video or image file with optional model caching.
+    Process a single video, image, or ordered frame-sequence directory.
     
     For videos, supports streaming mode (chunk_size > 0) which processes in memory-bounded
     chunks with temporal overlap for seamless transitions between chunks.
@@ -571,6 +703,7 @@ def process_single_file(input_path: str, args: argparse.Namespace, device_list: 
         Number of frames written to output
     """
     input_type = get_input_type(input_path)
+    directory_as_sequence = bool(getattr(args, "directory_as_sequence", False))
     
     if input_type == "unknown":
         debug.log(f"Skipping unsupported file: {input_path}", level="WARNING", category="file", force=True)
@@ -715,6 +848,185 @@ def process_single_file(input_path: str, args: argparse.Namespace, device_list: 
         debug.log(f"Output saved to: {output_path}", category="file", force=True)
         return frames_written
     
+    # === DIRECTORY FRAME-SEQUENCE PROCESSING ===
+    if input_type == "directory" and directory_as_sequence:
+        frame_paths = get_image_sequence_files(input_path)
+        if not frame_paths:
+            raise ValueError(f"No supported image frames found in directory: {input_path}")
+
+        if args.skip_first_frames > 0:
+            debug.log(f"Skipping first {args.skip_first_frames} frames", category="info")
+        frame_paths = _apply_frame_limits(frame_paths, args.skip_first_frames, args.load_cap)
+        frames_to_process = len(frame_paths)
+        if frames_to_process <= 0:
+            debug.log(
+                f"No frames to process after skipping {args.skip_first_frames} / load_cap {args.load_cap}",
+                level="WARNING",
+                category="file",
+                force=True,
+            )
+            return 0
+
+        fps = 30.0
+        debug.log(
+            f"Frame-sequence mode: {frames_to_process} ordered image frames, assumed {fps:.2f} FPS",
+            category="info",
+            force=True,
+        )
+
+        chunk_size = args.chunk_size if args.chunk_size > 0 else frames_to_process
+        streaming = args.chunk_size > 0 and chunk_size < frames_to_process
+        total_chunks = (frames_to_process + chunk_size - 1) // chunk_size
+        is_png = args.output_format == "png"
+        video_writer = None
+        overlap = args.temporal_overlap
+        frames_written = 0
+        base_name = Path(input_path).name
+
+        if streaming:
+            debug.log(
+                f"Frame-sequence streaming mode: chunks of {chunk_size} frames, overlap={overlap}",
+                category="info",
+                force=True,
+                indent_level=1,
+            )
+
+        if len(device_list) > 1:
+            frames_tensor, _ = extract_frames_from_directory(
+                input_path,
+                skip_first_frames=args.skip_first_frames,
+                load_cap=args.load_cap,
+            )
+            result = _gpu_processing(frames_tensor, device_list, args)
+            if is_png:
+                save_frames_to_image(result, output_path, base_name)
+            else:
+                video_writer = save_frames_to_video(
+                    result,
+                    output_path,
+                    fps,
+                    video_backend=args.video_backend,
+                    use_10bit=args.use_10bit,
+                    video_codec=args.video_codec,
+                    video_quality=args.video_quality,
+                    video_preset=args.video_preset,
+                    h265_tune=args.h265_tune,
+                    av1_film_grain=args.av1_film_grain,
+                    av1_film_grain_denoise=args.av1_film_grain_denoise,
+                )
+                if video_writer is not None:
+                    video_writer.release()
+            frames_written = int(result.shape[0])
+        else:
+            chunk_count = 0
+            if streaming:
+                prev_raw_tail = None
+                chunk_args = argparse.Namespace(**vars(args))
+                frame_index = 0
+                while frame_index < frames_to_process:
+                    read_count = min(chunk_size, frames_to_process - frame_index)
+                    current_paths = frame_paths[frame_index: frame_index + read_count]
+                    new_frames = _read_frames_from_paths(current_paths)
+                    if new_frames is None:
+                        break
+                    frame_index += int(new_frames.shape[0])
+                    chunk_count += 1
+
+                    if chunk_count > 1:
+                        chunk_args.prepend_frames = 0
+
+                    if prev_raw_tail is not None and overlap > 0:
+                        context_count = min(overlap, int(prev_raw_tail.shape[0]))
+                        frames = torch.cat([prev_raw_tail[-context_count:], new_frames], dim=0)
+                    else:
+                        frames = new_frames
+                        context_count = 0
+
+                    if chunk_count > 1:
+                        debug.log("", category="none", force=True)
+                        debug.log("━" * 60, category="none", force=True)
+                    debug.log("", category="none", force=True)
+                    debug.log(
+                        f"Chunk {chunk_count}/{total_chunks}: {new_frames.shape[0]} new + {context_count} context frames",
+                        category="generation",
+                        force=True,
+                    )
+                    debug.log("", category="none", force=True)
+
+                    result = _process_frames_core(
+                        frames_tensor=frames.to(torch.float16),
+                        args=chunk_args,
+                        device_id=device_list[0],
+                        debug=debug,
+                        runner_cache=runner_cache,
+                    )
+                    if context_count > 0:
+                        result = result[context_count:]
+
+                    prev_raw_tail = new_frames[-overlap:].clone() if overlap > 0 else None
+                    del frames
+
+                    if is_png:
+                        save_frames_to_image(result, output_path, base_name, start_index=frames_written)
+                    else:
+                        video_writer = save_frames_to_video(
+                            result,
+                            output_path,
+                            fps,
+                            writer=video_writer,
+                            video_backend=args.video_backend,
+                            use_10bit=args.use_10bit,
+                            video_codec=args.video_codec,
+                            video_quality=args.video_quality,
+                            video_preset=args.video_preset,
+                            h265_tune=args.h265_tune,
+                            av1_film_grain=args.av1_film_grain,
+                            av1_film_grain_denoise=args.av1_film_grain_denoise,
+                        )
+
+                    frames_written += int(result.shape[0])
+                    del result
+                    clear_memory(debug=debug, deep=True, force=True, timer_name="chunk_cleanup")
+            else:
+                frames_tensor, _ = extract_frames_from_directory(
+                    input_path,
+                    skip_first_frames=args.skip_first_frames,
+                    load_cap=args.load_cap,
+                )
+                processing_start = time.time()
+                if len(device_list) > 1:
+                    result = _gpu_processing(frames_tensor, device_list, args)
+                else:
+                    result = _single_gpu_direct_processing(frames_tensor, args, device_list[0], runner_cache)
+                debug.log(f"Processing time: {time.time() - processing_start:.2f}s", category="timing")
+
+                if is_png:
+                    save_frames_to_image(result, output_path, base_name)
+                else:
+                    video_writer = save_frames_to_video(
+                        result,
+                        output_path,
+                        fps,
+                        video_backend=args.video_backend,
+                        use_10bit=args.use_10bit,
+                        video_codec=args.video_codec,
+                        video_quality=args.video_quality,
+                        video_preset=args.video_preset,
+                        h265_tune=args.h265_tune,
+                        av1_film_grain=args.av1_film_grain,
+                        av1_film_grain_denoise=args.av1_film_grain_denoise,
+                    )
+                    if video_writer is not None:
+                        video_writer.release()
+                frames_written = int(result.shape[0])
+
+            if streaming:
+                debug.log("", category="none", force=True)
+                debug.log(f"Frame-sequence streaming complete: {frames_written} frames in {chunk_count} chunks", category="success", force=True)
+
+        debug.log(f"Output saved to: {output_path}", category="file", force=True)
+        return frames_written
+
     # === IMAGE PROCESSING ===
     frames_tensor, _ = extract_frames_from_image(input_path)
     
@@ -1964,6 +2276,9 @@ Examples:
 
   Basic video upscaling with temporal consistency:
     python {invocation} video.mp4 --resolution 720 --batch_size 33
+
+  Ordered frame-sequence folder as one temporal clip:
+    python {invocation} frames_folder/ --directory_as_sequence --output_format png
     
   Streaming mode for long videos with 10-bit video output (requires FFMPEG):
     python {invocation} long_video.mp4 --resolution 1080 --batch_size 33 --chunk_size 330 --temporal_overlap 3 --video_backend ffmpeg --10bit
@@ -1996,6 +2311,8 @@ Examples:
                         help="Output path (default: auto-generated in 'output/' directory)")
     io_group.add_argument("--output_format", type=str, default=None, choices=["mp4", "png", None],
                         help="Output format: 'mp4' (video) or 'png' (image sequence). Default: auto-detect from input type")
+    io_group.add_argument("--directory_as_sequence", action="store_true",
+                        help="Treat directory input as one ordered frame sequence clip instead of batch-processing files individually.")
     io_group.add_argument("--video_backend", type=str, default="opencv", choices=["opencv", "ffmpeg"],
                         help="Video encoder backend: 'opencv' (default) or 'ffmpeg' (requires ffmpeg in PATH)")
     io_group.add_argument("--10bit", dest="use_10bit", action="store_true",
@@ -2299,7 +2616,55 @@ def main() -> None:
         # Track if output format was user-specified or auto-detected
         format_auto_detected = args.output_format is None
         
-        if input_type == 'directory':
+        if input_type == 'directory' and args.directory_as_sequence:
+            frame_files = get_image_sequence_files(args.input)
+            if not frame_files:
+                debug.log(
+                    f"No supported image frames found in directory: {args.input}",
+                    level="ERROR",
+                    category="file",
+                    force=True,
+                )
+                sys.exit(1)
+
+            debug.log(
+                f"Frame-sequence directory mode: treating folder as one ordered clip ({len(frame_files)} frames)",
+                category="file",
+                force=True,
+            )
+
+            if format_auto_detected:
+                args.output_format = "mp4"
+
+            if (args.cache_dit or args.cache_vae) and len(device_list) > 1 and args.chunk_size <= 0:
+                debug.log(
+                    "Model caching requires streaming mode (--chunk_size > 0) for multi-GPU. "
+                    "Disabling caching for this run.",
+                    level="WARNING",
+                    category="cache",
+                    force=True,
+                )
+                args.cache_dit = False
+                args.cache_vae = False
+
+            runner_cache = {} if (args.cache_dit or args.cache_vae) and len(device_list) == 1 else None
+            output_path = generate_output_path(
+                args.input,
+                args.output_format,
+                args.output,
+                input_type="directory",
+                from_directory=False,
+            )
+            total_frames_processed += process_single_file(
+                args.input,
+                args,
+                device_list,
+                output_path,
+                format_auto_detected=format_auto_detected,
+                runner_cache=runner_cache,
+            )
+
+        elif input_type == 'directory':
             media_files = get_media_files(args.input)
             if not media_files:
                 debug.log(f"No video or image files found in directory: {args.input}", 
