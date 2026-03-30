@@ -21,6 +21,15 @@ from typing import Optional
 from torchvision.transforms import ToTensor, ToPILImage
 from ..common.half_precision_fixes import safe_pad_operation, safe_interpolate_operation, ensure_float32_precision
 
+LAB_SORT_MATCH_MAX_ELEMENTS = 16_777_216
+LAB_HISTOGRAM_BINS = 8192
+LAB_MAX_PIXELS_PER_CHUNK = 8_388_608
+LAB_CHANNEL_RANGES = (
+    (0.0, 100.0),
+    (-160.0, 160.0),
+    (-160.0, 160.0),
+)
+
 
 def adain_color_fix(target: Image.Image, source: Image.Image) -> Image.Image:
     """
@@ -278,7 +287,7 @@ def lab_color_transfer(
     """
     # Step 1: Apply wavelet to get artifact-free base with correct spatial structure
     content_feat = wavelet_reconstruction(content_feat, style_feat, debug=None)
-    
+
     # Handle spatial dimension mismatch (should already match after wavelet)
     if content_feat.shape != style_feat.shape:
         debug.log(
@@ -291,78 +300,230 @@ def lab_color_transfer(
             mode='bilinear',
             align_corners=False
         )
-    
-    # Store device and convert to float32
+
     device = content_feat.device
-    
+
     # Convert to float32 for accurate color space conversion
     content_feat, original_dtype = ensure_float32_precision(content_feat)
     style_feat, _ = ensure_float32_precision(style_feat)
-    
-    # Precompute color space conversion matrices
+
     rgb_to_xyz_matrix = torch.tensor([
         [0.4124564, 0.3575761, 0.1804375],
         [0.2126729, 0.7151522, 0.0721750],
         [0.0193339, 0.1191920, 0.9503041]
     ], dtype=torch.float32, device=device)
-    
+
     xyz_to_rgb_matrix = torch.tensor([
         [ 3.2404542, -1.5371385, -0.4985314],
         [-0.9692660,  1.8760108,  0.0415560],
         [ 0.0556434, -0.2040259,  1.0572252]
     ], dtype=torch.float32, device=device)
-    
-    # LAB conversion constants
+
     epsilon = 6.0 / 29.0
     kappa = (29.0 / 3.0) ** 3
-    
+
     # Convert from [-1, 1] to [0, 1] range (in-place)
     content_feat.add_(1.0).mul_(0.5).clamp_(0.0, 1.0)
     style_feat.add_(1.0).mul_(0.5).clamp_(0.0, 1.0)
-    
-    # Convert to LAB color space
-    content_lab = _rgb_to_lab_batch(content_feat, device, rgb_to_xyz_matrix, epsilon, kappa)
-    del content_feat
-    
-    style_lab = _rgb_to_lab_batch(style_feat, device, rgb_to_xyz_matrix, epsilon, kappa)
-    del style_feat, rgb_to_xyz_matrix
-    
-    # Match chrominance channels (a*, b*) for accurate color transfer
-    matched_a = _histogram_matching_channel(content_lab[:, 1], style_lab[:, 1], device)
-    matched_b = _histogram_matching_channel(content_lab[:, 2], style_lab[:, 2], device)
-    
-    # Handle luminance with weighted blending
-    if luminance_weight < 1.0:
-        # Partially match luminance for better overall color accuracy
-        matched_L = _histogram_matching_channel(content_lab[:, 0], style_lab[:, 0], device)
-        # Blend: preserve some content L* for detail, adopt some style L* for color
-        result_L = content_lab[:, 0].mul(luminance_weight).add_(matched_L.mul(1.0 - luminance_weight))
-        del matched_L
-    else:
-        # Fully preserve content luminance
-        result_L = content_lab[:, 0]
-    
-    del content_lab, style_lab
-    
-    # Reconstruct LAB with corrected channels
-    result_lab = torch.stack([result_L, matched_a, matched_b], dim=1)
-    del result_L, matched_a, matched_b
-    
-    # Convert back to RGB
-    result_rgb = _lab_to_rgb_batch(result_lab, device, xyz_to_rgb_matrix, epsilon, kappa)
-    del result_lab, xyz_to_rgb_matrix
-    
-    # Convert back to [-1, 1] range (in-place)
-    result = result_rgb.mul_(2.0).sub_(1.0)
-    del result_rgb
-    
-    # Restore original dtype
+
+    total_pixels = int(content_feat.shape[0]) * int(content_feat.shape[-2]) * int(content_feat.shape[-1])
+    if total_pixels <= LAB_SORT_MATCH_MAX_ELEMENTS:
+        if debug is not None:
+            debug.log(
+                f"LAB color transfer path: old system (legacy exact matcher, batch_pixels={total_pixels}, threshold={LAB_SORT_MATCH_MAX_ELEMENTS})",
+                category="video",
+                force=True,
+                indent_level=1,
+            )
+        content_lab = _rgb_to_lab_batch(content_feat, device, rgb_to_xyz_matrix, epsilon, kappa)
+        style_lab = _rgb_to_lab_batch(style_feat, device, rgb_to_xyz_matrix, epsilon, kappa)
+
+        matched_a = _histogram_matching_channel_exact(content_lab[:, 1], style_lab[:, 1], device)
+        matched_b = _histogram_matching_channel_exact(content_lab[:, 2], style_lab[:, 2], device)
+
+        if luminance_weight < 1.0:
+            matched_L = _histogram_matching_channel_exact(content_lab[:, 0], style_lab[:, 0], device)
+            result_L = content_lab[:, 0].mul(luminance_weight).add_(matched_L.mul(1.0 - luminance_weight))
+            del matched_L
+        else:
+            result_L = content_lab[:, 0]
+
+        del content_lab, style_lab, style_feat, rgb_to_xyz_matrix
+
+        result_lab = torch.stack([result_L, matched_a, matched_b], dim=1)
+        del result_L, matched_a, matched_b
+
+        result_rgb = _lab_to_rgb_batch(result_lab, device, xyz_to_rgb_matrix, epsilon, kappa)
+        del result_lab, xyz_to_rgb_matrix
+
+        result = result_rgb.mul_(2.0).sub_(1.0)
+        del result_rgb
+
+        if result.dtype != original_dtype:
+            result = result.to(original_dtype)
+
+        debug.log(f"LAB color transfer completed (luminance_weight={luminance_weight})", category="video", indent_level=1)
+        return result
+
+    frames_per_chunk = _lab_frames_per_chunk(content_feat)
+    if debug is not None:
+        debug.log(
+            f"LAB color transfer path: new system (streamed matcher, batch_pixels={total_pixels}, threshold={LAB_SORT_MATCH_MAX_ELEMENTS}, frames_per_chunk={frames_per_chunk})",
+            category="video",
+            force=True,
+            indent_level=1
+        )
+
+    # Build a batch-global CDF mapping without flattening or sorting the whole
+    # sequence at once. This preserves the LAB transfer behavior across the
+    # entire batch while avoiding 32-bit index limits in large high-res runs.
+    source_hists = [
+        torch.zeros(LAB_HISTOGRAM_BINS, dtype=torch.int64, device=device)
+        for _ in LAB_CHANNEL_RANGES
+    ]
+    reference_hists = [
+        torch.zeros(LAB_HISTOGRAM_BINS, dtype=torch.int64, device=device)
+        for _ in LAB_CHANNEL_RANGES
+    ]
+
+    for start, end in _iter_frame_ranges(int(content_feat.shape[0]), frames_per_chunk):
+        content_lab = _rgb_to_lab_batch(content_feat[start:end], device, rgb_to_xyz_matrix, epsilon, kappa)
+        style_lab = _rgb_to_lab_batch(style_feat[start:end], device, rgb_to_xyz_matrix, epsilon, kappa)
+
+        for channel_idx, (value_min, value_max) in enumerate(LAB_CHANNEL_RANGES):
+            _accumulate_histogram(content_lab[:, channel_idx], source_hists[channel_idx], value_min, value_max)
+            _accumulate_histogram(style_lab[:, channel_idx], reference_hists[channel_idx], value_min, value_max)
+
+        del content_lab, style_lab
+
+    channel_mappings = [
+        _build_histogram_mapping(source_hists[idx], reference_hists[idx], *LAB_CHANNEL_RANGES[idx])
+        for idx in range(len(LAB_CHANNEL_RANGES))
+    ]
+    del source_hists, reference_hists, style_feat
+
+    for start, end in _iter_frame_ranges(int(content_feat.shape[0]), frames_per_chunk):
+        content_lab = _rgb_to_lab_batch(content_feat[start:end], device, rgb_to_xyz_matrix, epsilon, kappa)
+
+        if luminance_weight < 1.0:
+            matched_L = _apply_histogram_mapping(
+                content_lab[:, 0],
+                channel_mappings[0],
+                *LAB_CHANNEL_RANGES[0],
+            )
+            result_L = content_lab[:, 0].mul(luminance_weight).add_(matched_L.mul(1.0 - luminance_weight))
+            del matched_L
+        else:
+            result_L = content_lab[:, 0]
+
+        matched_a = _apply_histogram_mapping(
+            content_lab[:, 1],
+            channel_mappings[1],
+            *LAB_CHANNEL_RANGES[1],
+        )
+        matched_b = _apply_histogram_mapping(
+            content_lab[:, 2],
+            channel_mappings[2],
+            *LAB_CHANNEL_RANGES[2],
+        )
+
+        result_lab = torch.stack([result_L, matched_a, matched_b], dim=1)
+        del result_L, matched_a, matched_b, content_lab
+
+        content_feat[start:end] = _lab_to_rgb_batch(result_lab, device, xyz_to_rgb_matrix, epsilon, kappa)
+        del result_lab
+
+    del channel_mappings, rgb_to_xyz_matrix, xyz_to_rgb_matrix
+
+    result = content_feat.mul_(2.0).sub_(1.0)
+
     if result.dtype != original_dtype:
         result = result.to(original_dtype)
-    
+
     debug.log(f"LAB color transfer completed (luminance_weight={luminance_weight})", category="video", indent_level=1)
-    
+
     return result
+
+
+def _lab_frames_per_chunk(batch: Tensor) -> int:
+    """Limit per-chunk spatial work so high-res LAB transfer avoids oversized ops."""
+    if batch.ndim < 4:
+        return 1
+    pixels_per_frame = max(1, int(batch.shape[-2]) * int(batch.shape[-1]))
+    return max(1, int(LAB_MAX_PIXELS_PER_CHUNK // pixels_per_frame))
+
+
+def _iter_frame_ranges(total_frames: int, frames_per_chunk: int):
+    step = max(1, int(frames_per_chunk))
+    total = max(0, int(total_frames))
+    for start in range(0, total, step):
+        yield start, min(total, start + step)
+
+
+def _scaled_histogram_positions(values: Tensor, value_min: float, value_max: float, bins: int) -> Tensor:
+    scale = float(bins - 1) / max(float(value_max - value_min), 1e-12)
+    clipped = values.clamp(min=float(value_min), max=float(value_max))
+    return (clipped - float(value_min)) * scale
+
+
+def _accumulate_histogram(values: Tensor, histogram: Tensor, value_min: float, value_max: float) -> None:
+    flat = values.reshape(-1)
+    if flat.numel() == 0:
+        return
+    scaled = _scaled_histogram_positions(flat, value_min, value_max, int(histogram.numel()))
+    indices = scaled.floor().to(torch.int64)
+    histogram.add_(torch.bincount(indices, minlength=int(histogram.numel())))
+
+
+def _build_histogram_mapping(source_hist: Tensor, reference_hist: Tensor, value_min: float, value_max: float) -> Tensor:
+    bins = int(source_hist.numel())
+    device = source_hist.device
+
+    if bins <= 1:
+        return torch.full((1,), float(value_min), device=device, dtype=torch.float32)
+
+    source_cdf = source_hist.to(torch.float64).cumsum(0)
+    reference_cdf = reference_hist.to(torch.float64).cumsum(0)
+
+    if float(source_cdf[-1].item()) <= 0.0 or float(reference_cdf[-1].item()) <= 0.0:
+        return torch.linspace(float(value_min), float(value_max), bins, device=device, dtype=torch.float32)
+
+    source_total = source_cdf[-1].clone()
+    reference_total = reference_cdf[-1].clone()
+    source_cdf.div_(source_total)
+    reference_cdf.div_(reference_total)
+
+    bin_centers = torch.linspace(float(value_min), float(value_max), bins, device=device, dtype=torch.float64)
+    right = torch.searchsorted(reference_cdf, source_cdf, right=False)
+    right.clamp_(0, bins - 1)
+    left = torch.clamp(right - 1, min=0)
+
+    left_cdf = reference_cdf[left]
+    right_cdf = reference_cdf[right]
+    denom = (right_cdf - left_cdf).clamp_min(1e-12)
+    weights = torch.where(
+        right == left,
+        torch.zeros_like(source_cdf),
+        (source_cdf - left_cdf) / denom,
+    )
+
+    mapping = bin_centers[left] + (bin_centers[right] - bin_centers[left]) * weights
+    return mapping.to(torch.float32)
+
+
+def _apply_histogram_mapping(values: Tensor, mapping: Tensor, value_min: float, value_max: float) -> Tensor:
+    bins = int(mapping.numel())
+    if bins <= 1:
+        return torch.full_like(values, float(value_min))
+
+    scaled = _scaled_histogram_positions(values, value_min, value_max, bins)
+    lower = scaled.floor().to(torch.int64)
+    upper = torch.clamp(lower + 1, max=bins - 1)
+    frac = (scaled - lower.to(dtype=scaled.dtype)).to(dtype=mapping.dtype)
+
+    lower_vals = mapping[lower]
+    upper_vals = mapping[upper]
+    return lower_vals + (upper_vals - lower_vals) * frac
 
 
 def _rgb_to_lab_batch(rgb: Tensor, device: torch.device, matrix: Tensor, epsilon: float, kappa: float) -> Tensor:
@@ -485,40 +646,68 @@ def _histogram_matching_channel(source: Tensor, reference: Tensor, device: torch
     Returns:
         Matched channel tensor [B, H, W]
     """
+    if source.numel() > LAB_SORT_MATCH_MAX_ELEMENTS or reference.numel() > LAB_SORT_MATCH_MAX_ELEMENTS:
+        return _histogram_matching_channel_binned(source, reference, device)
+
+    return _histogram_matching_channel_exact(source, reference, device)
+
+
+def _histogram_matching_channel_exact(source: Tensor, reference: Tensor, device: torch.device) -> Tensor:
+    """Exact histogram matching via sort/rank for smaller tensors."""
     original_shape = source.shape
-    
-    # Flatten
+
     source_flat = source.flatten()
     reference_flat = reference.flatten()
-    
-    # Sort both arrays
+
     source_sorted, source_indices = torch.sort(source_flat)
     reference_sorted, _ = torch.sort(reference_flat)
     del reference_flat
-    
-    # Quantile mapping
+
     n_source = len(source_sorted)
     n_reference = len(reference_sorted)
-    
+
     if n_source == n_reference:
         matched_sorted = reference_sorted
     else:
-        # Interpolate reference to match source quantiles
-        source_quantiles = torch.linspace(0, 1, n_source, device=device)
+        source_quantiles = torch.linspace(0, 1, n_source, device=device, dtype=reference_sorted.dtype)
         ref_indices = (source_quantiles * (n_reference - 1)).long()
         ref_indices.clamp_(0, n_reference - 1)
         matched_sorted = reference_sorted[ref_indices]
         del source_quantiles, ref_indices, reference_sorted
-    
+
     del source_sorted, source_flat
-    
-    # Reconstruct using argsort (portable across CUDA/ROCm/MPS)
+
     inverse_indices = torch.argsort(source_indices)
     del source_indices
     matched_flat = matched_sorted[inverse_indices]
     del matched_sorted, inverse_indices
-    
+
     return matched_flat.reshape(original_shape)
+
+
+def _histogram_matching_channel_binned(source: Tensor, reference: Tensor, device: torch.device) -> Tensor:
+    """
+    Approximate histogram matching using dense fixed bins.
+
+    This path avoids whole-tensor sort/index operations on large high-resolution
+    batches where temporary flattened tensors can exceed backend indexing limits.
+    """
+    src_min = float(torch.amin(source).item())
+    ref_min = float(torch.amin(reference).item())
+    src_max = float(torch.amax(source).item())
+    ref_max = float(torch.amax(reference).item())
+    value_min = min(src_min, ref_min)
+    value_max = max(src_max, ref_max)
+
+    if value_max <= value_min:
+        return source.clone()
+
+    source_hist = torch.zeros(LAB_HISTOGRAM_BINS, dtype=torch.int64, device=device)
+    reference_hist = torch.zeros(LAB_HISTOGRAM_BINS, dtype=torch.int64, device=device)
+    _accumulate_histogram(source, source_hist, value_min, value_max)
+    _accumulate_histogram(reference, reference_hist, value_min, value_max)
+    mapping = _build_histogram_mapping(source_hist, reference_hist, value_min, value_max)
+    return _apply_histogram_mapping(source, mapping, value_min, value_max)
 
 
 def hsv_saturation_histogram_match(content_feat: Tensor, style_feat: Tensor, debug: Optional['Debug'] = None) -> Tensor:
