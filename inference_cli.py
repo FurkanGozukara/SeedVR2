@@ -1521,6 +1521,9 @@ def _create_processing_runtime(
     compile_dynamic_mode = _normalize_compile_dynamic_mode(getattr(args, "compile_dynamic", None))
     torch_compile_args_dit = None
     torch_compile_args_vae = None
+    if getattr(args, "int8_convrot", False) and getattr(args, "compile_dit", False):
+        print("[SeedVR2] INT8 ConvRot is active - disabling Compile DiT (patched Linear forward is not traceable)", flush=True)
+        args.compile_dit = False
     if getattr(args, "compile_dit", False):
         torch_compile_args_dit = {
             "backend": args.compile_backend,
@@ -1568,7 +1571,8 @@ def _create_processing_runtime(
         tile_debug=args.tile_debug.lower() if args.tile_debug else "false",
         attention_mode=args.attention_mode,
         torch_compile_args_dit=torch_compile_args_dit,
-        torch_compile_args_vae=torch_compile_args_vae
+        torch_compile_args_vae=torch_compile_args_vae,
+        int8_convrot=bool(getattr(args, "int8_convrot", False)) and not str(args.dit_model or "").lower().endswith(".gguf")
     )
 
     ctx['cache_context'] = cache_context
@@ -2444,6 +2448,8 @@ Examples:
                         help="Max recompilation attempts before fallback to eager mode. Safety limit to prevent compilation loops (default: 128)")
     perf_group.add_argument("--split_phase_subprocesses", action="store_true",
                         help="Run VAE encode, DiT upscale, and VAE decode/postprocess in separate subprocesses for stronger phase-boundary VRAM cleanup. Slower, but reduces cross-phase allocator residue.")
+    perf_group.add_argument("--int8_convrot", action="store_true",
+                        help="Quantize DiT Linear weights to INT8 with block-diagonal Hadamard rotation after load (about half the DiT weight VRAM of BF16 and faster on NVIDIA Turing/SM 7.5 or newer). Ignored for GGUF models; disables Compile DiT.")
     
     # Model Caching (for batch processing)
     cache_group = parser.add_argument_group('Model caching (batch processing)')

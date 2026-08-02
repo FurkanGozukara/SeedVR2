@@ -773,7 +773,8 @@ def configure_runner(
     tile_debug: str = "false",
     attention_mode: str = 'sdpa',
     torch_compile_args_dit: Optional[Dict[str, Any]] = None,
-    torch_compile_args_vae: Optional[Dict[str, Any]] = None
+    torch_compile_args_vae: Optional[Dict[str, Any]] = None,
+    int8_convrot: bool = False
 ) -> Tuple[VideoDiffusionInfer, Dict[str, Any]]:
     """
     Configure VideoDiffusionInfer runner with model loading and settings.
@@ -849,6 +850,9 @@ def configure_runner(
         block_swap_config, debug
     )
     
+    # INT8 ConvRot flag consumed by materialize_model/_load_model_weights.
+    runner._dit_int8_convrot = bool(int8_convrot)
+
     # Phase 4: Setup models (load from cache or create new)
     _setup_models(
         runner, cache_context, dit_model, vae_model, 

@@ -523,8 +523,10 @@ def materialize_model(runner: VideoDiffusionInfer, model_type: str, device: torc
     debug.start_timer(f"{model_type}_materialize")
     
     # Load weights (this materializes from meta to target device)
+    int8_convrot = bool(is_dit and getattr(runner, '_dit_int8_convrot', False))
     model = _load_model_weights(model, checkpoint_path, target_device, True,
-                               model_type_upper, offload_reason, debug, override_dtype) 
+                               model_type_upper, offload_reason, debug, override_dtype,
+                               int8_convrot=int8_convrot) 
    
     # Apply model-specific configurations (includes BlockSwap and torch.compile)
     # Import here to avoid circular dependency 
@@ -546,7 +548,8 @@ def materialize_model(runner: VideoDiffusionInfer, model_type: str, device: torc
 
 def _load_model_weights(model: torch.nn.Module, checkpoint_path: str, target_device: torch.device, 
                         used_meta: bool, model_type: str, cpu_reason: str, 
-                        debug: Optional['Debug'] = None, override_dtype: Optional[torch.dtype] = None) -> torch.nn.Module:
+                        debug: Optional['Debug'] = None, override_dtype: Optional[torch.dtype] = None,
+                        int8_convrot: bool = False) -> torch.nn.Module:
     """
     Load model weights from checkpoint file with optimized GGUF support.
     
@@ -598,7 +601,14 @@ def _load_model_weights(model: torch.nn.Module, checkpoint_path: str, target_dev
     # Initialize meta buffers if needed
     if used_meta:
         initialize_meta_buffers(model, target_device, debug)
-    
+
+    # Optional INT8 ConvRot on-the-fly quantization (never for GGUF - those are
+    # already quantized). Runs after load_state_dict(assign=True) and meta-buffer
+    # init so real weights exist, and before BlockSwap/compile configuration.
+    if int8_convrot and not checkpoint_path.endswith('.gguf'):
+        from src.optimization.int8_convrot_runtime import apply_int8_convrot_to_model
+        apply_int8_convrot_to_model(model, debug=debug, model_type=model_type)
+
     return model
 
 
