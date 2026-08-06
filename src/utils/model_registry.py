@@ -76,6 +76,7 @@ def get_available_dit_models() -> List[str]:
         discovered_models = [
             filename for filename in model_files
             if filename not in MODEL_REGISTRY
+            and not filename.lower().endswith("_int8_convrot.safetensors")
         ]
         
         # Add discovered models to the list

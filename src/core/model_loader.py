@@ -571,15 +571,48 @@ def _load_model_weights(model: torch.nn.Module, checkpoint_path: str, target_dev
     """
     model_type_lower = model_type.lower()
     
+    source_checkpoint_path = checkpoint_path
+    load_path = checkpoint_path
+    int8_cache_path = None
+    using_int8_cache = False
+    if int8_convrot and checkpoint_path.lower().endswith('.safetensors'):
+        from src.optimization.int8_convrot_runtime import (
+            has_valid_int8_convrot_cache,
+            int8_convrot_cache_path,
+        )
+
+        int8_cache_path = int8_convrot_cache_path(checkpoint_path)
+        if has_valid_int8_convrot_cache(int8_cache_path, checkpoint_path):
+            load_path = str(int8_cache_path)
+            using_int8_cache = True
+            debug.log(
+                f"INT8 ConvRot cache hit: {int8_cache_path}",
+                category="precision",
+                force=True,
+            )
+
     # Log loading action
     action = "Materializing" if used_meta else "Loading"
     target_device_str = str(target_device).upper()
-    debug.log(f"{action} {model_type} weights to {target_device_str}{cpu_reason}: {checkpoint_path}", 
+    debug.log(f"{action} {model_type} weights to {target_device_str}{cpu_reason}: {load_path}",
              category=model_type_lower, force=True)
     
     # Load state dict from file
     debug.start_timer(f"{model_type_lower}_weights_load")
-    state = load_quantized_state_dict(checkpoint_path, target_device, debug)
+    try:
+        state = load_quantized_state_dict(load_path, target_device, debug)
+    except Exception as exc:
+        if not using_int8_cache:
+            raise
+        debug.log(
+            f"INT8 ConvRot cache could not be read; rebuilding from source: {exc}",
+            level="WARNING",
+            category="precision",
+            force=True,
+        )
+        load_path = source_checkpoint_path
+        using_int8_cache = False
+        state = load_quantized_state_dict(load_path, target_device, debug)
     debug.end_timer(f"{model_type_lower}_weights_load", f"{model_type} weights loaded from file")
     
     # Apply dtype conversion if requested
@@ -590,9 +623,32 @@ def _load_model_weights(model: torch.nn.Module, checkpoint_path: str, target_dev
     _log_weight_stats(state, used_meta, model_type, debug)
     
     # Handle GGUF or standard loading
-    if checkpoint_path.endswith('.gguf'):
+    if load_path.endswith('.gguf'):
         model = _load_gguf_weights(model, state, used_meta, model_type_lower, debug)
     else:
+        if using_int8_cache:
+            from src.optimization.int8_convrot_runtime import prepare_model_for_int8_convrot_cache
+
+            try:
+                patched = prepare_model_for_int8_convrot_cache(model, state)
+                debug.log(
+                    f"Prepared {patched} cached INT8 ConvRot Linear layers",
+                    category="precision",
+                    force=True,
+                )
+            except Exception as exc:
+                debug.log(
+                    f"INT8 ConvRot cache is incompatible; rebuilding from source: {exc}",
+                    level="WARNING",
+                    category="precision",
+                    force=True,
+                )
+                del state
+                load_path = source_checkpoint_path
+                using_int8_cache = False
+                state = load_quantized_state_dict(load_path, target_device, debug)
+                if override_dtype is not None:
+                    state = _convert_state_dtype(state, override_dtype, model_type, debug)
         model = _load_standard_weights(model, state, used_meta, model_type, model_type_lower, debug)
     
     # Clean up state dict
@@ -602,12 +658,65 @@ def _load_model_weights(model: torch.nn.Module, checkpoint_path: str, target_dev
     if used_meta:
         initialize_meta_buffers(model, target_device, debug)
 
+    # Env-gated (SECOURSES_INT8_CALIBRATE=1): record rotated-activation
+    # statistics during a plain FP16/BF16 run for the INT8 ConvRot converter.
+    if (
+        not int8_convrot
+        and model_type_lower == "dit"
+        and not source_checkpoint_path.endswith('.gguf')
+    ):
+        try:
+            from src.optimization.int8_calibration import maybe_start_calibration
+            maybe_start_calibration(model, source_checkpoint_path)
+        except Exception as exc:
+            debug.log(
+                f"INT8 calibration attach failed: {exc}",
+                level="WARNING",
+                category="precision",
+                force=True,
+            )
+
     # Optional INT8 ConvRot on-the-fly quantization (never for GGUF - those are
     # already quantized). Runs after load_state_dict(assign=True) and meta-buffer
     # init so real weights exist, and before BlockSwap/compile configuration.
-    if int8_convrot and not checkpoint_path.endswith('.gguf'):
-        from src.optimization.int8_convrot_runtime import apply_int8_convrot_to_model
-        apply_int8_convrot_to_model(model, debug=debug, model_type=model_type)
+    if int8_convrot and not source_checkpoint_path.endswith('.gguf'):
+        if using_int8_cache:
+            debug.log(
+                f"Using cached INT8 ConvRot DiT: {int8_cache_path}",
+                category="precision",
+                force=True,
+            )
+        else:
+            from src.optimization.int8_convrot_runtime import (
+                apply_int8_convrot_to_model,
+                save_int8_convrot_cache,
+            )
+
+            apply_int8_convrot_to_model(
+                model,
+                debug=debug,
+                model_type=model_type,
+                source_checkpoint=source_checkpoint_path,
+            )
+            if int8_cache_path is not None:
+                try:
+                    saved_path = save_int8_convrot_cache(
+                        model,
+                        int8_cache_path,
+                        source_checkpoint_path,
+                    )
+                    debug.log(
+                        f"Saved reusable INT8 ConvRot DiT cache: {saved_path}",
+                        category="precision",
+                        force=True,
+                    )
+                except Exception as exc:
+                    debug.log(
+                        f"Could not save INT8 ConvRot cache; this run will continue: {exc}",
+                        level="WARNING",
+                        category="precision",
+                        force=True,
+                    )
 
     return model
 
@@ -619,7 +728,11 @@ def _convert_state_dtype(state: Dict[str, torch.Tensor], target_dtype: torch.dty
     debug.start_timer(f"{model_type.lower()}_dtype_convert")
     
     for key in state:
-        if torch.is_tensor(state[key]) and state[key].is_floating_point():
+        if (
+            torch.is_tensor(state[key])
+            and state[key].is_floating_point()
+            and not key.endswith('.scale_weight')
+        ):
             state[key] = state[key].to(target_dtype)
     
     debug.end_timer(f"{model_type.lower()}_dtype_convert", f"{model_type} weights converted to {target_dtype}")

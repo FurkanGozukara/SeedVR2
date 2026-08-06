@@ -163,15 +163,45 @@ def download_with_resume(url: str, filepath: str, debug=None) -> bool:
         return False
 
 
-def download_weight(dit_model: str, vae_model: str, model_dir: Optional[str] = None, debug=None) -> bool:
+def download_weight(
+    dit_model: str,
+    vae_model: str,
+    model_dir: Optional[str] = None,
+    debug=None,
+    int8_convrot: bool = False,
+) -> bool:
     """Download SeedVR2 DiT and VAE models with integrity checking"""
     cache_dir = model_dir or get_base_cache_dir()
     os.makedirs(cache_dir, exist_ok=True)
     
-    files_to_download = [
-        (dit_model, MODEL_REGISTRY.get(dit_model)),
-        (vae_model, MODEL_REGISTRY.get(vae_model))
-    ]
+    use_prebuilt_int8_cache = False
+    if int8_convrot and str(dit_model).lower().endswith(".safetensors"):
+        try:
+            from src.optimization.int8_convrot_runtime import (
+                has_valid_int8_convrot_cache,
+                int8_convrot_cache_path,
+            )
+
+            source_path = os.path.join(cache_dir, dit_model)
+            cache_path = int8_convrot_cache_path(source_path)
+            use_prebuilt_int8_cache = has_valid_int8_convrot_cache(cache_path, source_path)
+            if use_prebuilt_int8_cache and debug:
+                debug.log(
+                    f"Using prebuilt INT8 ConvRot cache: {cache_path}",
+                    category="setup",
+                    force=True,
+                )
+        except Exception as exc:
+            if debug:
+                debug.log(
+                    f"INT8 cache validation failed; keeping source-generation fallback: {exc}",
+                    level="WARNING",
+                    category="setup",
+                )
+
+    files_to_download = [(vae_model, MODEL_REGISTRY.get(vae_model))]
+    if not use_prebuilt_int8_cache:
+        files_to_download.insert(0, (dit_model, MODEL_REGISTRY.get(dit_model)))
     
     for filename, model_info in files_to_download:
         if not model_info:

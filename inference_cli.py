@@ -109,6 +109,11 @@ else:
 
 # Heavy dependency imports after environment configuration
 import torch
+
+# Must run before model_registry imports the Diffusers VAE stack (and TorchAO).
+from src.utils.runtime_compat import configure_runtime_compat
+configure_runtime_compat()
+
 import cv2
 import numpy as np
 import subprocess
@@ -2449,7 +2454,7 @@ Examples:
     perf_group.add_argument("--split_phase_subprocesses", action="store_true",
                         help="Run VAE encode, DiT upscale, and VAE decode/postprocess in separate subprocesses for stronger phase-boundary VRAM cleanup. Slower, but reduces cross-phase allocator residue.")
     perf_group.add_argument("--int8_convrot", action="store_true",
-                        help="Quantize DiT Linear weights to INT8 with block-diagonal Hadamard rotation after load (about half the DiT weight VRAM of BF16 and faster on NVIDIA Turing/SM 7.5 or newer). Ignored for GGUF models; disables Compile DiT.")
+                        help="Load or create a reusable single-file INT8 ConvRot DiT cache with block-diagonal Hadamard rotation (about half the DiT weight VRAM of BF16 and faster on NVIDIA Turing/SM 7.5 or newer). Ignored for GGUF models; disables Compile DiT.")
     
     # Model Caching (for batch processing)
     cache_group = parser.add_argument_group('Model caching (batch processing)')
@@ -2609,7 +2614,13 @@ def main() -> None:
             debug.log(f"Using devices: {device_list}", category="device")
         
         # Download models once before processing
-        if not download_weight(dit_model=args.dit_model, vae_model=DEFAULT_VAE, model_dir=args.model_dir, debug=debug):
+        if not download_weight(
+            dit_model=args.dit_model,
+            vae_model=DEFAULT_VAE,
+            model_dir=args.model_dir,
+            debug=debug,
+            int8_convrot=bool(args.int8_convrot),
+        ):
             debug.log("Failed to download required models. Check console output above.", level="ERROR", category="download", force=True)
             sys.exit(1)
         
