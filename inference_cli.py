@@ -464,13 +464,41 @@ def get_image_sequence_files(directory: str) -> List[str]:
     return [str(f) for f in _logical_sort_paths(files)]
 
 
-def _read_sequence_image(image_path: str) -> np.ndarray:
+def _image_to_float01(frame: np.ndarray) -> np.ndarray:
     """
-    Read one sequence frame and convert to RGB/RGBA float32 [0,1].
+    Scale an OpenCV image array of any bit depth to float32 [0,1].
+
+    IMREAD_UNCHANGED keeps the file's depth: 16-bit PNG/TIFF arrive as uint16 and
+    float TIFFs as float32. Dividing those by 255 pushes values up to 257, which
+    the pipeline clamps into a blown-out white image.
     """
-    frame = cv2.imread(str(image_path), cv2.IMREAD_UNCHANGED)
+    if frame.dtype == np.uint8:
+        return frame.astype(np.float32) / 255.0
+    if np.issubdtype(frame.dtype, np.integer):
+        frame = frame.astype(np.float32) / float(np.iinfo(frame.dtype).max)
+    else:
+        frame = np.nan_to_num(frame.astype(np.float32), nan=0.0, posinf=1.0, neginf=0.0)
+    return np.clip(frame, 0.0, 1.0)
+
+
+def _read_image_rgb(image_path: str) -> np.ndarray:
+    """
+    Read one image file and convert to RGB/RGBA float32 [0,1].
+
+    Handles 8/16-bit and float files, grayscale and alpha, so every image
+    entry point feeds the pipeline the same normalized range. Decodes from
+    memory because cv2.imread cannot open non-ASCII paths on Windows.
+    """
+    try:
+        data = np.fromfile(str(image_path), dtype=np.uint8)
+    except OSError:
+        data = np.empty(0, dtype=np.uint8)
+    frame = cv2.imdecode(data, cv2.IMREAD_UNCHANGED) if data.size else None
     if frame is None:
-        raise ValueError(f"Cannot open image frame: {image_path}")
+        raise ValueError(f"Cannot open image file: {image_path}")
+
+    source_dtype = frame.dtype
+    frame = _image_to_float01(frame)
 
     if frame.ndim == 2:
         frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2RGB)
@@ -479,7 +507,10 @@ def _read_sequence_image(image_path: str) -> np.ndarray:
     else:
         frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
-    return frame.astype(np.float32) / 255.0
+    if source_dtype != np.uint8:
+        debug.log(f"Normalized {source_dtype} image to [0,1]: {Path(image_path).name}", category="file")
+
+    return frame
 
 
 def _apply_frame_limits(frame_paths: List[str], skip_first_frames: int, load_cap: int) -> List[str]:
@@ -502,7 +533,7 @@ def _read_frames_from_paths(frame_paths: List[str]) -> Optional[torch.Tensor]:
     reference_shape: Optional[Tuple[int, ...]] = None
 
     for frame_path in frame_paths:
-        frame = _read_sequence_image(frame_path)
+        frame = _read_image_rgb(frame_path)
         if reference_shape is None:
             reference_shape = tuple(frame.shape)
         elif tuple(frame.shape) != reference_shape:
@@ -570,21 +601,11 @@ def extract_frames_from_image(image_path: str) -> Tuple[torch.Tensor, float]:
     if not os.path.exists(image_path):
         raise FileNotFoundError(f"Image file not found: {image_path}")
     
-    # Read image with alpha channel preserved
-    frame = cv2.imread(image_path, cv2.IMREAD_UNCHANGED)
-    if frame is None:
-        raise ValueError(f"Cannot open image file: {image_path}")
-    
-    # Convert BGR(A) to RGB(A) based on channel count
+    # Read as RGB(A) float32 [0,1] with alpha preserved, whatever the bit depth
+    frame = _read_image_rgb(image_path)
     if frame.shape[2] == 4:
-        frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2RGBA)
         debug.log(f"Detected RGBA image (alpha channel preserved)", category="file")
-    else:
-        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    
-    # Convert to float32 and normalize
-    frame = frame.astype(np.float32) / 255.0
-    
+
     # Convert to tensor [1, H, W, C]
     frames_tensor = torch.from_numpy(frame[None, ...]).to(torch.float16)
     
@@ -1188,7 +1209,12 @@ def _save_image_bgr(frame_np: np.ndarray, file_path: str) -> None:
         frame_bgr = cv2.cvtColor(frame_np, cv2.COLOR_RGBA2BGRA)
     else:
         frame_bgr = cv2.cvtColor(frame_np, cv2.COLOR_RGB2BGR)
-    cv2.imwrite(file_path, frame_bgr)
+    # imencode + tofile: on Windows cv2.imwrite reports success for non-ASCII
+    # paths but writes the file under a mangled name.
+    ok, encoded = cv2.imencode(Path(file_path).suffix or ".png", frame_bgr)
+    if not ok:
+        raise ValueError(f"Cannot encode image: {file_path}")
+    encoded.tofile(str(file_path))
 
 
 def save_frames_to_video(
