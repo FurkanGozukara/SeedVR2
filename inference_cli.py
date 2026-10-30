@@ -63,7 +63,8 @@ if script_dir not in sys.path:
     sys.path.insert(0, script_dir)
 
 # Set environment variable so all spawned processes can find modules
-os.environ['PYTHONPATH'] = script_dir + ':' + os.environ.get('PYTHONPATH', '')
+_inherited_pythonpath = os.environ.get('PYTHONPATH', '')
+os.environ['PYTHONPATH'] = script_dir + (os.pathsep + _inherited_pythonpath if _inherited_pythonpath else '')
 
 # Ensure safe CUDA usage with multiprocessing
 if mp.get_start_method(allow_none=True) != 'spawn':
@@ -77,7 +78,10 @@ if platform.system() == "Darwin":
     os.environ.setdefault("PYTORCH_MPS_HIGH_WATERMARK_RATIO", "0.0")
     os.environ.setdefault("PYTORCH_MPS_LOW_WATERMARK_RATIO", "0.0")
 else:
-    os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "backend:cudaMallocAsync")
+    # cudaMallocAsync ignores per_process_memory_fraction, the cap the app sets so a run never
+    # spills into shared GPU memory; keep it only when nothing configured the allocator.
+    if not os.environ.get("PYTORCH_ALLOC_CONF") and not os.environ.get("PYTORCH_CUDA_ALLOC_CONF"):
+        os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "backend:cudaMallocAsync"
 
     # Pre-parse arguments that must be handled before torch import
     _pre_parser = argparse.ArgumentParser(add_help=False)
