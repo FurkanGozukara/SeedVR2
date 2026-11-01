@@ -230,6 +230,9 @@ class NaDiT(nn.Module):
                 cache=cache,
             )
 
+        if vid.dtype != emb.dtype:  # fp32 residual mode (fp16 compute): back to the compute dtype
+            vid = vid.clamp(-65504.0, 65504.0).to(emb.dtype)
+
         # Video output norm.
         if self.vid_out_norm:
             vid = self.vid_out_norm(vid)

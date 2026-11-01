@@ -12,6 +12,7 @@
 # // See the License for the specific language governing permissions and
 # // limitations under the License.
 
+import os
 from typing import Union
 import torch
 from PIL import Image
@@ -65,11 +66,19 @@ class DivisiblePad:
         if pad_height == 0 and pad_width == 0:
             return image
 
-        # Pad symmetrically (or bottom/right)
+        # Pad bottom/right. SEEDVR2_PAD_MODE=reflect mirrors the edge rows/columns instead
+        # of black (Flirt-Inc f69b8e749a / ussoewwin 874e6e36d9); the padding is cropped
+        # from the output either way.
         if isinstance(image, torch.Tensor):
             # Pad format: (left, right, top, bottom)
             padding = (0, pad_width, 0, pad_height)
-            image = torch.nn.functional.pad(image, padding, mode='constant', value=0.0)
+            pad_mode = os.environ.get("SEEDVR2_PAD_MODE", "constant").strip().lower()
+            if pad_mode in ("reflect", "replicate") and image.ndim >= 3:
+                if pad_mode == "reflect" and (pad_width >= width or pad_height >= height):
+                    pad_mode = "replicate"
+                image = torch.nn.functional.pad(image, padding, mode=pad_mode)
+            else:
+                image = torch.nn.functional.pad(image, padding, mode='constant', value=0.0)
         elif isinstance(image, Image.Image):
             new_width = width + pad_width
             new_height = height + pad_height

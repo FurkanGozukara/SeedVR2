@@ -68,6 +68,27 @@ from ..utils.color_fix import (
 )
 
 
+def _phase_boundary_flush() -> bool:
+    """Release the allocator cache at phase boundaries (in-process runs). SEEDVR2_PHASE_FLUSH=0 disables it."""
+    return os.environ.get("SEEDVR2_PHASE_FLUSH", "1").strip() != "0"
+
+
+def _phase_mem(debug, label: str, reset: bool = False) -> None:
+    """SEEDVR2_PHASE_MEM_LOG=1: log this process's PyTorch peak allocated / reserved GB (calibration only)."""
+    if os.environ.get("SEEDVR2_PHASE_MEM_LOG", "").strip() != "1" or not torch.cuda.is_available():
+        return
+    try:
+        gib = 1024 ** 3
+        debug.log(f"[phase-mem] {label}: peak allocated {torch.cuda.max_memory_allocated() / gib:.3f} GB, "
+                  f"peak reserved {torch.cuda.max_memory_reserved() / gib:.3f} GB, now allocated "
+                  f"{torch.cuda.memory_allocated() / gib:.3f} / reserved {torch.cuda.memory_reserved() / gib:.3f} GB",
+                  category="memory", force=True)
+        if reset:
+            torch.cuda.reset_peak_memory_stats()
+    except Exception:
+        pass
+
+
 def _format_seconds_per_iteration(duration_seconds: float) -> str:
     """Format a single-iteration duration using tqdm-style `s/it` wording."""
     try:
@@ -326,7 +347,7 @@ def encode_all_batches(
     
     try:
         # Materialize VAE if still on meta device
-        if runner.vae and next(runner.vae.parameters()).device.type == 'meta':
+        if runner.vae is not None and next(runner.vae.parameters()).device.type == 'meta':
             materialize_model(runner, "vae", ctx['vae_device'], runner.config, debug)
         else:
             # Model already materialized (cached) - apply any pending configs if needed
@@ -338,7 +359,7 @@ def encode_all_batches(
         ensure_precision_initialized(ctx, runner, debug)
 
         # Cache VAE now that it's fully configured and ready for inference
-        if ctx['cache_context']['vae_cache'] and not ctx['cache_context']['cached_vae']:
+        if ctx['cache_context']['vae_cache'] and ctx['cache_context']['cached_vae'] is None:
             runner.vae._model_name = ctx['cache_context']['vae_model']
             ctx['cache_context']['global_cache'].set_vae(
                 {'node_id': ctx['cache_context']['vae_id'], 'cache_model': True}, 
@@ -347,7 +368,7 @@ def encode_all_batches(
             ctx['cache_context']['vae_newly_cached'] = True
             
             # If both models now cached, cache runner template
-            dit_is_cached = ctx['cache_context']['cached_dit'] or ctx['cache_context']['dit_newly_cached']
+            dit_is_cached = ctx['cache_context']['cached_dit'] is not None or ctx['cache_context']['dit_newly_cached']
             if dit_is_cached:
                 ctx['cache_context']['global_cache'].set_runner(
                     ctx['cache_context']['dit_id'], ctx['cache_context']['vae_id'], 
@@ -598,7 +619,12 @@ def encode_all_batches(
                         category="memory",
                         force=True,
                     )
-    
+        elif _phase_boundary_flush():
+            # The DiT phase needs large contiguous attention/MLP workspaces; blocks the VAE
+            # encode left in the allocator cache can fragment them. Release only cached
+            # blocks (encoded latents already sit on tensor_offload_device).
+            clear_memory(debug=debug, deep=False, force=True, timer_name="phase1_to_phase2")
+
     debug.end_timer("phase1_encoding", "Phase 1: VAE encoding complete", show_breakdown=True)
     debug.log_memory_state("After phase 1 (VAE encoding)", show_tensors=False)
     
@@ -683,7 +709,7 @@ def upscale_all_batches(
     
     try:
         # Materialize DiT if still on meta device
-        if runner.dit and next(runner.dit.parameters()).device.type == 'meta':
+        if runner.dit is not None and next(runner.dit.parameters()).device.type == 'meta':
             materialize_model(runner, "dit", ctx['dit_device'], runner.config, debug)
         else:
             # Model already materialized (cached) - apply any pending configs if needed
@@ -695,7 +721,7 @@ def upscale_all_batches(
         ensure_precision_initialized(ctx, runner, debug)
 
         # Cache DiT now that it's fully configured and ready for inference
-        if ctx['cache_context']['dit_cache'] and not ctx['cache_context']['cached_dit']:
+        if ctx['cache_context']['dit_cache'] and ctx['cache_context']['cached_dit'] is None:
             runner.dit._model_name = ctx['cache_context']['dit_model']
             ctx['cache_context']['global_cache'].set_dit(
                 {'node_id': ctx['cache_context']['dit_id'], 'cache_model': True}, 
@@ -704,7 +730,7 @@ def upscale_all_batches(
             ctx['cache_context']['dit_newly_cached'] = True
             
             # If both models now cached, cache runner template
-            vae_is_cached = ctx['cache_context']['cached_vae'] or ctx['cache_context']['vae_newly_cached']
+            vae_is_cached = ctx['cache_context']['cached_vae'] is not None or ctx['cache_context']['vae_newly_cached']
             if vae_is_cached:
                 ctx['cache_context']['global_cache'].set_runner(
                     ctx['cache_context']['dit_id'], ctx['cache_context']['vae_id'], 
@@ -712,8 +738,13 @@ def upscale_all_batches(
                 )
         
         # Move DiT to GPU for upscaling (no-op if already there)
-        manage_model_device(model=runner.dit, target_device=ctx['dit_device'], 
+        manage_model_device(model=runner.dit, target_device=ctx['dit_device'],
                             model_name="DiT", debug=debug, runner=runner)
+
+        if _phase_boundary_flush():
+            # Materialization and dtype conversion leave dead temporary blocks in the
+            # allocator cache; release them before the first large DiT workspace.
+            clear_memory(debug=debug, deep=False, force=True, timer_name="dit_materialization_to_inference")
 
         debug.log_memory_state("After DiT loading for upscaling", detailed_tensors=False)
 
@@ -861,8 +892,10 @@ def upscale_all_batches(
                             category="blockswap", indent_level=1)
 
         # Cleanup DiT as it's no longer needed after upscaling
+        # (drop this frame's reference first, so cleanup_dit can free it)
+        dit_model = None
         cleanup_dit(runner=runner, debug=debug, cache_model=cache_model)
-        
+
         # Cleanup text embeddings as they're no longer needed after upscaling
         cleanup_text_embeddings(ctx, debug)
 
@@ -890,7 +923,11 @@ def upscale_all_batches(
                         category="memory",
                         force=True,
                     )
-    
+        elif _phase_boundary_flush():
+            # DiT and VAE decoding allocate different shapes; return the unused DiT cache
+            # so decoding does not start on a fragmented allocator.
+            clear_memory(debug=debug, deep=False, force=True, timer_name="phase2_to_phase3")
+
     debug.end_timer("phase2_upscaling", "Phase 2: DiT upscaling complete", show_breakdown=True)
     debug.log_memory_state("After phase 2 (DiT upscaling)", show_tensors=False)
     
@@ -942,6 +979,7 @@ def decode_all_batches(
     
     debug.log("", category="none", force=True)
     debug.log("━━━━━━━━ Phase 3: VAE decoding ━━━━━━━━", category="none", force=True)
+    _phase_mem(debug, "before phase 3", reset=True)
     debug.start_timer("phase3_decoding")
 
     # Count valid latents
@@ -986,7 +1024,7 @@ def decode_all_batches(
     
     try:
         # VAE should already be materialized from encoding phase
-        if runner.vae and next(runner.vae.parameters()).device.type == 'meta':
+        if runner.vae is not None and next(runner.vae.parameters()).device.type == 'meta':
             materialize_model(runner, "vae", ctx['vae_device'], runner.config, debug)
 
         # Precision should already be initialized from encoding phase
@@ -1207,6 +1245,13 @@ def postprocess_all_batches(
     
     debug.log("", category="none", force=True)
     debug.log("━━━━━━━━ Phase 4: Post-processing ━━━━━━━━", category="none", force=True)
+    _phase_mem(debug, "phase 3 (decode)", reset=False)
+    if torch.cuda.is_available() and os.environ.get("SEEDVR2_PHASE4_FLUSH", "1").strip() != "0":
+        # Phase 4 works on whole batches of output frames (color correction in float32) with block sizes
+        # the decoder's cached blocks rarely fit: without this release the allocator reserved both
+        # (measured 21.1 GB reserved vs 16.2 GB allocated, 720p 61 frames). Output is unchanged.
+        clear_memory(debug=debug, deep=False, force=True, timer_name="phase3_to_phase4")
+    _phase_mem(debug, "before phase 4", reset=True)
     debug.start_timer("phase4_postprocessing")
     
     # Total_frames represents the original input frame count (set in Phase 1)
@@ -1589,6 +1634,7 @@ def postprocess_all_batches(
             release_tensor_memory(ctx['input_images'])
             del ctx['input_images']
 
+    _phase_mem(debug, "phase 4 (post-processing)", reset=False)
     debug.end_timer("phase4_postprocessing", "Phase 4: Post-processing complete", show_breakdown=True)
     debug.log_memory_state("After phase 4 (Post-processing)", show_tensors=False)
     

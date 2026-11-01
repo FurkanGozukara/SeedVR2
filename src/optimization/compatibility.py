@@ -44,7 +44,13 @@ def ensure_flash_attn_safe():
     try:
         import flash_attn
     except (ImportError, OSError):
-        # DLL broken or not installed - create stub with proper __spec__
+        # Only stub a package that is installed but broken. A stub for an absent
+        # package makes importlib.util.find_spec() truthy, which breaks callers
+        # that gate on it and then import unguarded (xformers.ops.fmha.flash,
+        # transformers' flash-attn availability check).
+        if importlib.machinery.PathFinder().find_spec('flash_attn') is None:
+            return
+        # DLL broken - create stub with proper __spec__
         stub = types.ModuleType('flash_attn')
         stub.__spec__ = importlib.machinery.ModuleSpec('flash_attn', None)
         stub.__file__ = None
@@ -99,7 +105,12 @@ def ensure_bitsandbytes_safe():
         import bitsandbytes
         # Success - bitsandbytes works, other nodes can use it
     except (ImportError, OSError, RuntimeError, ValueError):
-        # Installation broken, not present, or version detection failed - create stub
+        # Same reasoning as in ensure_flash_attn_safe(): a stub for an absent
+        # package makes find_spec() truthy, and peft's is_bnb_available() then
+        # reports bitsandbytes as usable (is_bnb_4bit_available() -> AttributeError).
+        if importlib.machinery.PathFinder().find_spec('bitsandbytes') is None:
+            return
+        # Installation broken, or version detection failed - create stub
         stub = types.ModuleType('bitsandbytes')
         stub.__spec__ = importlib.machinery.ModuleSpec('bitsandbytes', None)
         stub.__file__ = None
@@ -695,6 +706,10 @@ def _probe_bfloat16_support() -> bool:
         raise
 
 BFLOAT16_SUPPORTED = _probe_bfloat16_support()
+# Testing override: SEEDVR2_COMPUTE_DTYPE=float16 runs the fp16 path that GPUs without bf16
+# GEMM (Volta, older) take, on any GPU.
+if os.environ.get("SEEDVR2_COMPUTE_DTYPE", "").strip().lower() in ("float16", "fp16"):
+    BFLOAT16_SUPPORTED = False
 COMPUTE_DTYPE = torch.bfloat16 if BFLOAT16_SUPPORTED else torch.float16
 
 

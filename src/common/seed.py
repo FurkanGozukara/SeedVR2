@@ -14,7 +14,6 @@
 
 import random
 from typing import Optional
-import numpy as np
 import torch
 
 from .distributed import get_global_rank
@@ -24,7 +23,10 @@ def set_seed(seed: Optional[int], same_across_ranks: bool = False):
     """Function that sets the seed for pseudo-random number generators."""
     if seed is not None:
         seed += get_global_rank() if not same_across_ranks else 0
+        # Wrap into torch's 0..2**64-1 range (callers add offsets such as seed + 1_000_000).
+        # numpy's global RNG is not seeded: nothing in generation reads it, and
+        # np.random.seed() rejects seeds above 2**32-1 (Delcado19 bfdb942dc9).
+        seed = int(seed) & 0xFFFFFFFFFFFFFFFF
         random.seed(seed)
-        np.random.seed(seed)
         torch.manual_seed(seed)
 

@@ -186,6 +186,8 @@ class NaDiT(nn.Module):
                 cache=cache,
             )
 
+        if vid.dtype != emb.dtype:  # fp32 residual mode (fp16 compute): back to the compute dtype
+            vid = vid.clamp(-65504.0, 65504.0).to(emb.dtype)
         vid, vid_shape = self.vid_out(vid, vid_shape, cache)
         return NaDiTOutput(vid_sample=vid)
 
@@ -349,5 +351,7 @@ class NaDiTUpscaler(nn.Module):
                 cache=cache,
             )
 
+        if vid.dtype != emb.dtype:  # fp32 residual mode (fp16 compute): back to the compute dtype
+            vid = vid.clamp(-65504.0, 65504.0).to(emb.dtype)
         vid, vid_shape = self.vid_out(vid, vid_shape, cache)
         return NaDiTOutput(vid_sample=vid)

@@ -617,7 +617,8 @@ def _initialize_cache_context(
     # Model name validation prevents stale cache when user switches models in UI
     if dit_cache and dit_model and dit_id is not None:
         cached_model = global_cache.get_dit({'node_id': dit_id, 'cache_model': True}, debug)
-        if cached_model:
+        # Compare with None: bool() of a torch.compile'd module calls __len__ and raises
+        if cached_model is not None:
             # Verify cached model matches requested model by checking _model_name attribute
             cached_model_name = getattr(cached_model, '_model_name', None)
             if cached_model_name == dit_model:
@@ -637,7 +638,8 @@ def _initialize_cache_context(
     # Check for cached VAE model with model name validation
     if vae_cache and vae_model and vae_id is not None:
         cached_model = global_cache.get_vae({'node_id': vae_id, 'cache_model': True}, debug)
-        if cached_model:
+        # Compare with None: bool() of a torch.compile'd module calls __len__ and raises
+        if cached_model is not None:
             # Verify cached model matches requested model by checking _model_name attribute
             cached_model_name = getattr(cached_model, '_model_name', None)
             if cached_model_name == vae_model:
@@ -707,6 +709,16 @@ def _acquire_runner(
         return _create_new_runner(dit_model, vae_model, base_cache_dir, debug)
 
 
+def config_directory_for_dit_model(dit_model: str) -> str:
+    """Architecture config folder for a DiT checkpoint name (keboqi aae0630e3e)."""
+    name = str(dit_model or "").lower()
+    if "1.4b" in name or "_6l_" in name:
+        return "./configs_1_4b"  # six-layer distill of the 7B sharp model
+    if "7b" in name:
+        return "./configs_7b"
+    return "./configs_3b"
+
+
 def _create_new_runner(
     dit_model: str,
     vae_model: str,
@@ -722,6 +734,7 @@ def _create_new_runner(
     
     Args:
         dit_model: DiT model filename (determines config selection)
+                  - Contains "1.4b" or "_6l_" → loads configs_1_4b/main.yaml
                   - Contains "7b" → loads configs_7b/main.yaml
                   - Otherwise → loads configs_3b/main.yaml
         vae_model: VAE model filename (stored for reference, not used in config selection)
@@ -739,9 +752,7 @@ def _create_new_runner(
              category="runner", force=True)
     
     debug.start_timer("config_load")
-    config_path = os.path.join(script_directory, 
-                              './configs_7b' if "7b" in dit_model else './configs_3b', 
-                              'main.yaml')
+    config_path = os.path.join(script_directory, config_directory_for_dit_model(dit_model), 'main.yaml')
     config = load_config(config_path)
     debug.end_timer("config_load", "Config loading")
     
@@ -987,7 +998,7 @@ def _setup_models(
         runner._dit_block_swap_config = runner._new_dit_block_swap_config
         runner._dit_attention_mode = runner._new_dit_attention_mode
         # Also store on model so config travels with the model when cached
-        if hasattr(runner, 'dit') and runner.dit:
+        if hasattr(runner, 'dit') and runner.dit is not None:
             runner.dit._config_compile = runner._new_dit_compile_args
             runner.dit._config_swap = runner._new_dit_block_swap_config
             runner.dit._config_attn = runner._new_dit_attention_mode
@@ -1003,7 +1014,7 @@ def _setup_models(
         runner._vae_compile_args = runner._new_vae_compile_args
         runner._vae_tiling_config = runner._new_vae_tiling_config
         # Also store on model so config travels with the model when cached
-        if hasattr(runner, 'vae') and runner.vae:
+        if hasattr(runner, 'vae') and runner.vae is not None:
             runner.vae._config_compile = runner._new_vae_compile_args
             runner.vae._config_tiling = runner._new_vae_tiling_config
     
@@ -1155,6 +1166,13 @@ def _setup_vae_model(
         
         # Set VAE dtype from runner's compute_dtype
         compute_dtype = getattr(runner, '_compute_dtype', torch.bfloat16)
+        from ..optimization.vae_fusion import fused_vae_requested, get_vae_fused_path_unsupported_reason
+        if (fused_vae_requested() and torch.cuda.is_available()
+                and not getattr(runner, "_new_vae_compile_args", None)  # torch.compile'd VAE keeps the standard path
+                and get_vae_fused_path_unsupported_reason(torch.device("cuda")) is None):
+            # The fused VAE kernels (fp16-accumulate conv3d, fused GroupNorm+SiLU) need the fp16 weights
+            # as shipped; infer.py converts the inputs/outputs explicitly.
+            compute_dtype = torch.float16
         vae_dtype_str = str(compute_dtype).split('.')[-1]
         runner.config.vae.dtype = vae_dtype_str
         runner._vae_dtype_override = compute_dtype

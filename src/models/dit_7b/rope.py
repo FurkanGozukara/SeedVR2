@@ -20,6 +20,7 @@ from rotary_embedding_torch import RotaryEmbedding, apply_rotary_emb
 from torch import nn
 
 from ...common.cache import Cache
+from ...optimization.dit_memory import rope_apply
 
 
 class RotaryEmbeddingBase(nn.Module):
@@ -83,12 +84,9 @@ class NaRotaryEmbedding3d(RotaryEmbedding3d):
     ]:
         freqs = cache("rope_freqs_3d", lambda: self.get_freqs(shape))
         freqs = freqs.to(device=q.device, dtype=q.dtype)
-        q = rearrange(q, "L h d -> h L d")
-        k = rearrange(k, "L h d -> h L d")
-        q = apply_rotary_emb(freqs, q.float()).to(q.dtype)
-        k = apply_rotary_emb(freqs, k.float()).to(k.dtype)
-        q = rearrange(q, "h L d -> L h d")
-        k = rearrange(k, "h L d -> L h d")
+        # Same arithmetic as apply_rotary_emb(freqs, q.float()) over "h L d", in token chunks
+        q = rope_apply(apply_rotary_emb, freqs, q)
+        k = rope_apply(apply_rotary_emb, freqs, k)
         return q, k
 
     @torch._dynamo.disable  # Disable compilation: shape.tolist() is data-dependent and causes graph breaks

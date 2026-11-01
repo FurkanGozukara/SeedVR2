@@ -36,6 +36,7 @@ dequantize + F.linear path with identical outputs, just without the speedup.
 from __future__ import annotations
 
 import math
+import os
 from typing import Dict, Iterable, Optional, Tuple
 
 import torch
@@ -801,6 +802,34 @@ def _triton_int8_convrot_linear(
     return output.to(out_dtype)
 
 
+_CK_INT8: Dict[str, object] = {"checked": False, "fn": None}
+
+
+def _comfy_kitchen_int8_linear():
+    """comfy_kitchen's CUDA int8_linear (fused Hadamard rotate + per-token INT8 quantize, CUTLASS INT8 GEMM
+    with the dequant / bias epilogue), or None. Same regular Hadamard and per-row weight scales as this
+    module, so the cached INT8 ConvRot weights run on it unchanged. SEEDVR2_INT8_BACKEND=triton keeps the
+    Triton / torch._int_mm path."""
+    if not _CK_INT8["checked"]:
+        _CK_INT8["checked"] = True
+        if os.environ.get("SEEDVR2_INT8_BACKEND", "").strip().lower() not in ("triton", "torch"):
+            try:
+                import comfy_kitchen.backends.cuda as ck_cuda
+
+                if getattr(ck_cuda, "_EXT_AVAILABLE", False) and hasattr(ck_cuda, "int8_linear"):
+                    _CK_INT8["fn"] = ck_cuda.int8_linear
+            except Exception:
+                _CK_INT8["fn"] = None
+    return _CK_INT8["fn"]
+
+
+def _ara_down_unrotated(ara_down: torch.Tensor, group_size: int, dtype: torch.dtype) -> torch.Tensor:
+    """ARA acts on the rotated input: (x H) @ D.T == x @ (D H.T).T, so fold H into D once per call (rank x K)."""
+    r, k = ara_down.shape
+    h = build_hadamard(group_size, device=ara_down.device, dtype=torch.float32)
+    return (ara_down.float().reshape(r, k // group_size, group_size) @ h.T).reshape(r, k).to(dtype)
+
+
 def int8_convrot_linear(
     x: torch.Tensor,
     q_weight: torch.Tensor,
@@ -820,11 +849,43 @@ def int8_convrot_linear(
     (per-(row, K-group)); the per-group layout needs the Triton kernel and
     otherwise uses the dequantized fallback.
     """
+    if x.dtype == torch.float32 and x.is_cuda:
+        # The DiT runs under torch.autocast: F.linear would compute in the autocast dtype, but this custom
+        # forward received the float32 output of an autocast fp32 op (norm / modulation) and used to keep
+        # float32 for the whole residual stream (about +35 % activation memory, slower attention).
+        try:
+            if torch.is_autocast_enabled("cuda"):
+                x = x.to(torch.get_autocast_dtype("cuda"))
+        except TypeError:  # older PyTorch API
+            if torch.is_autocast_enabled():
+                x = x.to(torch.get_autocast_gpu_dtype())
     out_features = q_weight.shape[0]
     x2d = x.reshape(-1, x.shape[-1])
     on_gpu = supports_int_mm(x2d.device) and q_weight.device == x2d.device
     scale2d = weight_scale.reshape(out_features, -1)
     per_group = scale2d.shape[1] > 1
+
+    # comfy_kitchen's precompiled kernels: about 1.6x faster per layer than the Triton path below, with
+    # no per-process autotune (which a one-step model pays inside its only step) and no float32 [M, N]
+    # temporaries for the low-rank ARA branch (folded onto the unrotated input instead).
+    ck_int8 = _comfy_kitchen_int8_linear() if (on_gpu and not per_group and group_size == 256
+                                               and x2d.dtype in (torch.float16, torch.bfloat16)) else None
+    if not _CK_INT8.get("logged"):
+        _CK_INT8["logged"] = True
+        print(f"[INT8 ConvRot] linear path: {'comfy_kitchen int8_linear' if ck_int8 is not None else 'Triton / torch._int_mm'} "
+              f"(on_gpu={on_gpu}, per_group={per_group}, group={group_size}, x={x2d.dtype}, w={q_weight.device})", flush=True)
+    if ck_int8 is not None:
+        try:
+            out = ck_int8(x2d, q_weight, scale2d.reshape(-1).float(),
+                          None if bias is None else bias.to(x2d.dtype), out_dtype=x2d.dtype,
+                          convrot=True, convrot_groupsize=group_size)
+            if ara_down is not None and ara_up is not None:
+                low = x2d @ _ara_down_unrotated(ara_down, group_size, x2d.dtype).T
+                out = out.addmm_(low, ara_up.to(x2d.dtype).T)
+            return out.reshape(*x.shape[:-1], out_features)
+        except Exception as exc:  # pragma: no cover - driver specific
+            print(f"[INT8 ConvRot] comfy_kitchen int8_linear failed ({str(exc)[:160]}); using the Triton path", flush=True)
+            _CK_INT8["fn"] = None
 
     if on_gpu and _triton_available():
         try:

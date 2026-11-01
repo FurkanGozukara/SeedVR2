@@ -12,6 +12,7 @@ Key Features:
 - I/O component offloading for maximum memory savings
 """
 
+import os
 import time
 import types
 import torch
@@ -448,6 +449,90 @@ def _log_memory_summary(
         debug.log(f"Total VRAM saved: {total_offloaded:.2f}MB (~{total_offloaded/1024:.2f}GB)", category="blockswap", indent_level=1)
 
 
+# --------------------------------------------------------------------------------------
+# Prefetching swap (SEEDVR2_BLOCKSWAP_PREFETCH=1): every swapped block keeps one pinned CPU
+# master copy of its weights. Running a block copies them to the GPU (on a side stream,
+# started while the previous block computes) and afterwards just points the parameters
+# back at the master copy: weights never change during inference, so the synchronous
+# GPU->CPU copy of the default path is not needed. Two swapped blocks are on the GPU at a
+# time (the running one and the prefetched one). Same weights, same kernels: outputs are
+# identical to the synchronous path.
+# --------------------------------------------------------------------------------------
+_PREFETCH_ENABLED = os.environ.get("SEEDVR2_BLOCKSWAP_PREFETCH", "0").strip() == "1"
+_copy_streams: Dict[Any, Any] = {}
+
+
+def _prefetch_supported(model) -> bool:
+    return (_PREFETCH_ENABLED and torch.cuda.is_available()
+            and torch.device(model.main_device).type == "cuda"
+            and torch.device(model.offload_device).type == "cpu")
+
+
+@torch._dynamo.disable
+def _block_tensors(block: torch.nn.Module) -> List[torch.Tensor]:
+    """Parameters and buffers of a block (each tensor object once)."""
+    seen, out = set(), []
+    for t in list(block.parameters()) + list(block.buffers()):
+        if id(t) not in seen:
+            seen.add(id(t))
+            out.append(t)
+    return out
+
+
+@torch._dynamo.disable
+def _ensure_pinned_master(block: torch.nn.Module) -> List[Any]:
+    masters = getattr(block, "_bs_masters", None)
+    if masters is None:
+        masters = []
+        for t in _block_tensors(block):
+            data = t.data if t.data.device.type == "cpu" else t.data.cpu()
+            if not data.is_pinned():
+                try:
+                    data = data.pin_memory()
+                except RuntimeError:
+                    pass  # pinning failed (host limits): pageable copy still works, only slower
+            t.data = data
+            masters.append((t, data))
+        block._bs_masters = masters
+    return masters
+
+
+@torch._dynamo.disable
+def _start_block_copy(block: torch.nn.Module, device: torch.device) -> None:
+    """Begin copying a swapped block's weights to the GPU on the copy stream."""
+    if getattr(block, "_bs_pending", None) is not None:
+        return
+    masters = _ensure_pinned_master(block)
+    stream = _copy_streams.get(device)
+    if stream is None:
+        stream = torch.cuda.Stream(device=device)
+        _copy_streams[device] = stream
+    stream.wait_stream(torch.cuda.current_stream(device))
+    with torch.cuda.stream(stream):
+        gpu = [m.to(device, non_blocking=True) for _, m in masters]
+        event = torch.cuda.Event()
+        event.record(stream)
+    block._bs_pending = (gpu, event)
+
+
+@torch._dynamo.disable
+def _activate_block(block: torch.nn.Module, device: torch.device) -> None:
+    _start_block_copy(block, device)
+    gpu, event = block._bs_pending
+    block._bs_pending = None
+    current = torch.cuda.current_stream(device)
+    current.wait_event(event)
+    for (t, _), g in zip(block._bs_masters, gpu):
+        g.record_stream(current)  # the allocator must not reuse it before the forward ends
+        t.data = g
+
+
+@torch._dynamo.disable
+def _release_block(block: torch.nn.Module) -> None:
+    for t, master in block._bs_masters:
+        t.data = master
+
+
 def _wrap_block_forward(
     block: torch.nn.Module,
     block_idx: int,
@@ -489,7 +574,7 @@ def _wrap_block_forward(
         model = model_ref()
         debug = debug_ref()
         
-        if not model:
+        if model is None:
             # Model has been garbage collected, fall back to original
             return original_forward(*args, **kwargs)
 
@@ -498,10 +583,23 @@ def _wrap_block_forward(
             # Use dynamo-disabled helper to get start time (avoids compilation warnings)
             t_start = _get_swap_start_time(debug, debug.enabled if debug else False)
 
+            if _prefetch_supported(model) and next(self.parameters()).device.type == "cpu":
+                device = torch.device(model.main_device)
+                if device.index is None:
+                    device = torch.device("cuda", torch.cuda.current_device())
+                _activate_block(self, device)
+                nxt = self._block_idx + 1
+                if nxt <= model.blocks_to_swap and nxt < len(model.blocks):
+                    _start_block_copy(model.blocks[nxt], device)  # overlaps this block's compute
+                output = original_forward(*args, **kwargs)
+                _release_block(self)
+                _log_swap_timing(debug, t_start, self._block_idx, "block")
+                return output
+
             # Only move to GPU if necessary
             current_device = next(self.parameters()).device
             target_device = torch.device(model.main_device)
-            
+
             if current_device != target_device:
                 self.to(model.main_device, non_blocking=False)
 
@@ -569,7 +667,7 @@ def _wrap_io_forward(
         model = model_ref()
         debug = debug_ref()
         
-        if not model:
+        if model is None:
             # Model has been garbage collected, fall back to original
             return self._original_forward(*args, **kwargs)
 
@@ -809,6 +907,29 @@ def set_blockswap_bypass(runner, bypass: bool, debug):
         debug.log("BlockSwap protection renabled to avoid accidentally offloading the entire DiT model", category="success")
 
 
+def _restore_method(obj: Any, name: str, original: Any) -> None:
+    """
+    Undo an instance-level method patch without leaving a reference cycle.
+
+    Wrapping stores a bound method on the instance (``obj.forward = ...``). If the
+    method being restored is the class's own method bound to ``obj``, assigning it
+    back stores ``obj -> bound method -> obj`` in the instance ``__dict__``: a cycle
+    that reference counting never frees. For a DiT whose blocks are swapped to the
+    CPU, that cycle keeps every CPU-resident weight alive after ``cleanup_dit``
+    until the next full ``gc.collect()``. Deleting the instance attribute restores
+    the class method lookup with no cycle; anything else is assigned back unchanged.
+    (Port of Anymatix b202981815.)
+    """
+    class_attr = getattr(type(obj), name, None)
+    if (getattr(original, '__self__', None) is obj
+            and class_attr is not None
+            and getattr(original, '__func__', None) is getattr(class_attr, '__func__', class_attr)):
+        if name in obj.__dict__:
+            object.__delattr__(obj, name)
+    else:
+        setattr(obj, name, original)
+
+
 def cleanup_blockswap(runner, keep_state_for_cache=False):
     """
     Clean up BlockSwap configuration based on caching mode.
@@ -868,7 +989,7 @@ def cleanup_blockswap(runner, keep_state_for_cache=False):
         restored_count = 0
         for block in model.blocks:
             if hasattr(block, '_original_forward'):
-                block.forward = block._original_forward
+                _restore_method(block, 'forward', block._original_forward)
                 delattr(block, '_original_forward')
                 restored_count += 1
                 
@@ -883,7 +1004,7 @@ def cleanup_blockswap(runner, keep_state_for_cache=False):
     # 2. Restore RoPE patches
     if hasattr(model, '_rope_patches'):
         for module, original_method in model._rope_patches:
-            module.get_axial_freqs = original_method
+            _restore_method(module, 'get_axial_freqs', original_method)
             # Clean up wrapper attributes
             for attr in ['_rope_wrapped', '_original_get_axial_freqs']:
                 if hasattr(module, attr):
@@ -895,7 +1016,7 @@ def cleanup_blockswap(runner, keep_state_for_cache=False):
     if hasattr(model, '_io_swappers'):
         for module, module_name in model._io_swappers:
             if hasattr(module, '_original_forward'):
-                module.forward = module._original_forward
+                _restore_method(module, 'forward', module._original_forward)
                 # Clean up wrapper attributes
                 for attr in ['_original_forward', '_model_ref', '_debug_ref', 
                            '_module_name', '_is_io_wrapped']:
@@ -917,7 +1038,7 @@ def cleanup_blockswap(runner, keep_state_for_cache=False):
 
     # 4. Restore original .to() method
     if hasattr(model, '_original_to'):
-        model.to = model._original_to
+        _restore_method(model, 'to', model._original_to)
         delattr(model, '_original_to')
         debug.log("Restored original .to() method", category="success")
 

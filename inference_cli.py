@@ -1061,13 +1061,22 @@ def process_single_file(input_path: str, args: argparse.Namespace, device_list: 
     frames_tensor, _ = extract_frames_from_image(input_path)
     
     processing_start = time.time()
-    # Process frames (multiprocessing only for multi-GPU)
-    if len(device_list) > 1:
-        result = _gpu_processing(frames_tensor, device_list, args)
-    else:
-        result = _single_gpu_direct_processing(frames_tensor, args, device_list[0], runner_cache)
+    # Single images keep the standard VAE kernels unless the user asked for the fused path: its channels-last
+    # weights and first-call costs are not amortized on one frame (encode 0.7 -> 13 s measured).
+    fused_default = "SEEDVR2_FUSED_VAE" not in os.environ
+    if fused_default:
+        os.environ["SEEDVR2_FUSED_VAE"] = "0"
+    try:
+        # Process frames (multiprocessing only for multi-GPU)
+        if len(device_list) > 1:
+            result = _gpu_processing(frames_tensor, device_list, args)
+        else:
+            result = _single_gpu_direct_processing(frames_tensor, args, device_list[0], runner_cache)
+    finally:
+        if fused_default:
+            os.environ.pop("SEEDVR2_FUSED_VAE", None)
     debug.log(f"Processing time: {time.time() - processing_start:.2f}s", category="timing")
-    
+
     # Save single image
     os.makedirs(Path(output_path).parent, exist_ok=True)
     frame_np = next(_iter_uint8_frames(result[0:1], conversion_batch_size=1))
@@ -1113,7 +1122,8 @@ def _stream_video_chunks(
     log_progress: bool = False,
     total_chunks: int = 0,
     cleanup_timer_name: Optional[str] = None,
-    log_prefix: str = ""
+    log_prefix: str = "",
+    strip_prepend: bool = True
 ) -> Generator[torch.Tensor, None, None]:
     """
     Generator that streams and processes video chunks.
@@ -1181,9 +1191,10 @@ def _stream_video_chunks(
             args=chunk_args,
             device_id=device_id,
             debug=debug,
-            runner_cache=runner_cache
+            runner_cache=runner_cache,
+            strip_prepend=strip_prepend
         )
-        
+
         # Remove context frames from output
         if context_count > 0:
             result = result[context_count:]
@@ -1907,31 +1918,49 @@ def _run_internal_split_phase(parsed_args: argparse.Namespace) -> None:
 # Core Processing Logic
 # =============================================================================
 
+def _strip_prepended_frames(result_tensor: torch.Tensor, args: argparse.Namespace, debug: Debug) -> torch.Tensor:
+    """Drop the reversed warm-up frames that compute_generation_info prepended (prepend_frames)."""
+    count = int(getattr(args, "prepend_frames", 0) or 0)
+    if count <= 0:
+        return result_tensor
+    if count < result_tensor.shape[0]:
+        debug.log(f"Removing {count} prepended frames from output", category="generation")
+        return result_tensor[count:]
+    debug.log(f"prepend_frames ({count}) >= total frames ({result_tensor.shape[0]}), skipping removal",
+              level="WARNING", category="generation", force=True)
+    return result_tensor
+
+
 def _process_frames_core(
     frames_tensor: torch.Tensor,
     args: argparse.Namespace,
     device_id: str,
     debug: Debug,
-    runner_cache: Optional[Dict[str, Any]] = None
+    runner_cache: Optional[Dict[str, Any]] = None,
+    strip_prepend: bool = True
 ) -> torch.Tensor:
     """
     Core frame processing logic shared between worker and direct processing.
-    
+
     Executes the complete 4-phase pipeline: encode → upscale → decode → postprocess.
     Supports both cached (direct) and non-cached (worker) execution modes.
-    
+
     Args:
         frames_tensor: Input frames [T, H, W, C], Float16/Float32, range [0,1]
         args: Command-line arguments with all processing settings
         device_id: Device ID for inference ("0", "1", etc.)
         debug: Debug instance for logging
         runner_cache: Optional cache dict for model reuse (direct mode only)
-    
+        strip_prepend: Remove the prepended warm-up frames here. True on one GPU, where
+                       nothing downstream does it; False in multi-GPU workers, where
+                       _gpu_processing strips them after combining the workers.
+
     Returns:
         Upscaled frames tensor [T', H', W', C], floating-point, range [0,1]
     """
     if getattr(args, "split_phase_subprocesses", False):
-        return _run_split_phase_pipeline(frames_tensor, args, device_id, debug)
+        result_tensor = _run_split_phase_pipeline(frames_tensor, args, device_id, debug)
+        return _strip_prepended_frames(result_tensor, args, debug) if strip_prepend else result_tensor
 
     runner, ctx, cache_dit, cache_vae = _create_processing_runtime(
         args,
@@ -1990,17 +2019,19 @@ def _process_frames_core(
     ctx = postprocess_all_batches(
         ctx=ctx, debug=debug, progress_callback=None,
         color_correction=args.color_correction,
-        prepend_frames=0,  # Worker mode handles this in main process
+        prepend_frames=0,  # stripped below (one GPU) or after combining workers (multi-GPU)
         temporal_overlap=args.temporal_overlap,
         batch_size=args.batch_size
     )
-    
+
     result_tensor = ctx['final_video']
-    
+
     # Move to CPU for downstream save/IPC paths.
     if result_tensor.is_cuda or result_tensor.is_mps:
         result_tensor = result_tensor.cpu()
-    
+
+    if strip_prepend:
+        result_tensor = _strip_prepended_frames(result_tensor, args, debug)
     return result_tensor
 
 
@@ -2070,7 +2101,8 @@ def _worker_process(
             runner_cache=runner_cache,
             log_progress=total_chunks > 1,
             total_chunks=total_chunks,
-            log_prefix=f"[GPU {proc_idx}] "
+            log_prefix=f"[GPU {proc_idx}] ",
+            strip_prepend=False  # _gpu_processing strips after combining workers
         ):
             results.append(result.cpu())
         
@@ -2085,7 +2117,8 @@ def _worker_process(
             args=args,
             device_id="0",
             debug=worker_debug,
-            runner_cache=None
+            runner_cache=None,
+            strip_prepend=False  # _gpu_processing strips after combining workers
         )
     
     # NumPy IPC path does not support bfloat16/float8; keep memory pressure low with float16.

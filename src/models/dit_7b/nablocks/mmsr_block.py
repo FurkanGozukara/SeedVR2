@@ -12,6 +12,7 @@
 # // See the License for the specific language governing permissions and
 # // limitations under the License.
 
+import os
 from typing import Tuple, Union
 import torch
 from einops import rearrange
@@ -30,6 +31,16 @@ from ..normalization import norm_layer_type
 from ..rope import NaRotaryEmbedding3d
 from ..window import get_window_op
 from ....common.half_precision_fixes import safe_pad_operation
+
+# fp16 compute only: residual streams kept in fp32 between blocks (all | txt | off)
+_FP16_RESIDUAL = os.environ.get("SEEDVR2_FP16_RESIDUAL", "all").strip().lower()
+
+
+def _finite(x: torch.Tensor) -> torch.Tensor:
+    """fp16 branch outputs past the fp16 range become inf; keep them at the range limit so they
+    cannot turn into NaN in the next norm (inf * 0)."""
+    return torch.nan_to_num(x, nan=0.0, posinf=65504.0, neginf=-65504.0) if x.dtype == torch.float16 else x
+
 
 class NaSwinAttention(MMWindowAttention):
     def __init__(
@@ -104,6 +115,9 @@ class NaSwinAttention(MMWindowAttention):
             lambda: na.window_idx(vid_shape, make_window),
         )
         vid_qkv_win = window_partition(vid_qkv)
+        # The window partition owns a reordered copy; the original projection has no
+        # remaining readers and must not stay resident through attention.
+        vid_qkv = None
 
         vid_qkv_win = rearrange(vid_qkv_win, "l (o h d) -> l o h d", o=3, d=self.head_dim)
         txt_qkv = rearrange(txt_qkv, "l (o h d) -> l o h d", o=3, d=self.head_dim)
@@ -235,6 +249,9 @@ class NaMMSRTransformerBlock(MMWindowTransformerBlock):
             "branch_tag": MMArg("vid", "txt"),
         }
 
+        if emb.dtype == torch.float16 and _FP16_RESIDUAL != "off":
+            return self._forward_fp32_residual(vid, txt, vid_shape, txt_shape, cache, ada_kwargs)
+
         vid_attn, txt_attn = self.attn_norm(vid, txt)
         vid_attn, txt_attn = self.ada(vid_attn, txt_attn, layer="attn", mode="in", **ada_kwargs)
         vid_attn, txt_attn = self.attn(vid_attn, txt_attn, vid_shape, txt_shape, cache)
@@ -248,3 +265,31 @@ class NaMMSRTransformerBlock(MMWindowTransformerBlock):
         vid_mlp, txt_mlp = (vid_mlp + vid_attn), (txt_mlp + txt_attn)
 
         return vid_mlp, txt_mlp, vid_shape, txt_shape
+
+    def _forward_fp32_residual(self, vid, txt, vid_shape, txt_shape, cache, ada_kwargs):
+        """fp16 compute (GPUs without bf16 GEMM): the residual streams grow past the fp16 range
+        (65504) in the deeper blocks, which corrupts or blanks the output. Keep the residual
+        stream(s) in fp32 between blocks and run each block's norm, attention and MLP in fp16 on
+        the normalized (bounded) activations. SEEDVR2_FP16_RESIDUAL=txt keeps only the text
+        stream in fp32, =off restores the plain fp16 path. NaDiT casts vid back after the last block."""
+        half = torch.float16
+        keep_vid = _FP16_RESIDUAL == "all"
+        vid = vid.float() if keep_vid else vid
+        txt = txt.float()
+        vid_attn, txt_attn = self.attn_norm(vid, txt)
+        vid_attn, txt_attn = vid_attn.to(half), txt_attn.to(half)
+        vid_attn, txt_attn = self.ada(vid_attn, txt_attn, layer="attn", mode="in", **ada_kwargs)
+        vid_attn, txt_attn = self.attn(vid_attn, txt_attn, vid_shape, txt_shape, cache)
+        vid_attn, txt_attn = self.ada(vid_attn, txt_attn, layer="attn", mode="out", **ada_kwargs)
+        vid = vid + _finite(vid_attn).to(vid.dtype)
+        txt = txt + _finite(txt_attn).float()
+        del vid_attn, txt_attn
+
+        vid_mlp, txt_mlp = self.mlp_norm(vid, txt)
+        vid_mlp, txt_mlp = vid_mlp.to(half), txt_mlp.to(half)
+        vid_mlp, txt_mlp = self.ada(vid_mlp, txt_mlp, layer="mlp", mode="in", **ada_kwargs)
+        vid_mlp, txt_mlp = self.mlp(vid_mlp, txt_mlp)
+        vid_mlp, txt_mlp = self.ada(vid_mlp, txt_mlp, layer="mlp", mode="out", **ada_kwargs)
+        vid = vid + _finite(vid_mlp).to(vid.dtype)
+        txt = txt + _finite(txt_mlp).float()
+        return vid, txt, vid_shape, txt_shape

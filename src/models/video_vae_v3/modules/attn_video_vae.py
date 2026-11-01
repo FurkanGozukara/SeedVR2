@@ -52,11 +52,13 @@ from .types import (
     _receptive_field_t,
 )
 from ....optimization.memory_manager import retry_on_oom
+from ....optimization.vae_fusion import fused_group_norm_silu, is_fusable_norm_silu
 
 logger = get_logger(__name__)  # pylint: disable=invalid-name
 
 class Upsample3D(Upsample2D):
     """A 3D upsampling layer with an optional convolution."""
+    fused_path = False  # Set by enable_vae_fused_path (SEEDVR2_FUSED_VAE)
 
     def __init__(
         self,
@@ -134,6 +136,15 @@ class Upsample3D(Upsample2D):
         for i in range(len(hidden_states)):
             def upscale_and_rearrange():
                 temp = self.upscale_conv(hidden_states[i])
+                if self.fused_path and temp.is_contiguous(memory_format=torch.channels_last_3d):
+                    # Fused VAE path: same pixel shuffle, written out in NDHWC for the following conv
+                    return rearrange(
+                        temp,
+                        "b (x y z c) f h w -> b (f z) (h x) (w y) c",
+                        x=self.spatial_ratio,
+                        y=self.spatial_ratio,
+                        z=self.temporal_ratio,
+                    ).permute(0, 4, 1, 2, 3)
                 return rearrange(
                     temp,
                     "b (x y z c) f h w -> b c (f z) (h x) (w y)",
@@ -251,6 +262,8 @@ class Downsample3D(Downsample2D):
 
 
 class ResnetBlock3D(ResnetBlock2D):
+    fused_path = False  # Set by enable_vae_fused_path (SEEDVR2_FUSED_VAE)
+
     def __init__(
         self,
         *args,
@@ -313,13 +326,16 @@ class ResnetBlock3D(ResnetBlock2D):
     ):
         hidden_states = input_tensor
 
-        hidden_states = causal_norm_wrapper(self.norm1, hidden_states)
-        hidden_states = retry_on_oom(
-            self.nonlinearity,
-            hidden_states,
-            debug=getattr(self, 'debug', None),
-            operation_name="ResnetBlock3D.nonlinearity"
-        )
+        if self.fused_path and is_fusable_norm_silu(self.norm1, self.nonlinearity, hidden_states):
+            hidden_states = fused_group_norm_silu(self.norm1, hidden_states)
+        else:
+            hidden_states = causal_norm_wrapper(self.norm1, hidden_states)
+            hidden_states = retry_on_oom(
+                self.nonlinearity,
+                hidden_states,
+                debug=getattr(self, 'debug', None),
+                operation_name="ResnetBlock3D.nonlinearity"
+            )
 
         if self.upsample is not None:
             # upsample_nearest_nhwc fails with large batch sizes.
@@ -343,13 +359,16 @@ class ResnetBlock3D(ResnetBlock2D):
         if temb is not None and self.time_embedding_norm == "default":
             hidden_states = hidden_states + temb
 
-        hidden_states = causal_norm_wrapper(self.norm2, hidden_states)
+        if self.fused_path and temb is None and is_fusable_norm_silu(self.norm2, self.nonlinearity, hidden_states):
+            hidden_states = fused_group_norm_silu(self.norm2, hidden_states)
+        else:
+            hidden_states = causal_norm_wrapper(self.norm2, hidden_states)
 
-        if temb is not None and self.time_embedding_norm == "scale_shift":
-            scale, shift = torch.chunk(temb, 2, dim=1)
-            hidden_states = hidden_states * (1 + scale) + shift
+            if temb is not None and self.time_embedding_norm == "scale_shift":
+                scale, shift = torch.chunk(temb, 2, dim=1)
+                hidden_states = hidden_states * (1 + scale) + shift
 
-        hidden_states = self.nonlinearity(hidden_states)
+            hidden_states = self.nonlinearity(hidden_states)
 
         hidden_states = self.dropout(hidden_states)
         hidden_states = self.conv2(hidden_states, memory_state=memory_state)
@@ -669,6 +688,8 @@ class UNetMidBlock3D(nn.Module):
 
 
 class Encoder3D(nn.Module):
+    fused_path = False  # Set by enable_vae_fused_path (SEEDVR2_FUSED_VAE)
+
     r"""
     [Override] override most logics to support extra condition input and causal conv
 
@@ -849,14 +870,19 @@ class Encoder3D(nn.Module):
             sample = self.mid_block(sample, memory_state=memory_state)
 
         # post-process
-        sample = causal_norm_wrapper(self.conv_norm_out, sample)
-        sample = self.conv_act(sample)
+        if self.fused_path and is_fusable_norm_silu(self.conv_norm_out, self.conv_act, sample):
+            sample = fused_group_norm_silu(self.conv_norm_out, sample)
+        else:
+            sample = causal_norm_wrapper(self.conv_norm_out, sample)
+            sample = self.conv_act(sample)
         sample = self.conv_out(sample, memory_state=memory_state)
 
         return sample
 
 
 class Decoder3D(nn.Module):
+    fused_path = False  # Set by enable_vae_fused_path (SEEDVR2_FUSED_VAE)
+
     r"""
     The `Decoder` layer of a variational autoencoder that
     decodes its latent representation into an output sample.
@@ -1028,8 +1054,11 @@ class Decoder3D(nn.Module):
                 sample = up_block(sample, latent_embeds, memory_state=memory_state)
 
         # post-process
-        sample = causal_norm_wrapper(self.conv_norm_out, sample)
-        sample = self.conv_act(sample)
+        if self.fused_path and is_fusable_norm_silu(self.conv_norm_out, self.conv_act, sample):
+            sample = fused_group_norm_silu(self.conv_norm_out, sample)
+        else:
+            sample = causal_norm_wrapper(self.conv_norm_out, sample)
+            sample = self.conv_act(sample)
         sample = self.conv_out(sample, memory_state=memory_state)
 
         return sample
@@ -1064,6 +1093,7 @@ class VideoAutoencoderKL(diffusers.AutoencoderKL):
     """
     We simply inherit the model code from diffusers
     """
+    fused_path = False  # Set by enable_vae_fused_path (SEEDVR2_FUSED_VAE)
 
     def __init__(
         self,
@@ -1224,6 +1254,11 @@ class VideoAutoencoderKL(diffusers.AutoencoderKL):
         
         output = causal_conv_gather_outputs(output)
         
+        # Fused VAE path works in NDHWC: hand back the standard layout (phase 2 draws its
+        # noise with randn_like(latent), which follows the latent's strides)
+        if self.fused_path:
+            output = output.contiguous(memory_format=torch.contiguous_format)
+        
         # MPS memory leak workaround (pytorch/pytorch#155060)
         if self.device.type == 'mps':
             torch.mps.empty_cache()
@@ -1243,6 +1278,11 @@ class VideoAutoencoderKL(diffusers.AutoencoderKL):
         
         output = self.decoder(_z, memory_state=memory_state)
         output = causal_conv_gather_outputs(output)
+        
+        # Fused VAE path works in NDHWC: hand back the standard layout (phase 2 draws its
+        # noise with randn_like(latent), which follows the latent's strides)
+        if self.fused_path:
+            output = output.contiguous(memory_format=torch.contiguous_format)
         
         # MPS memory leak workaround (pytorch/pytorch#155060)
         if self.device.type == 'mps':

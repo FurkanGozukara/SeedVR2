@@ -197,6 +197,9 @@ class NaSwinAttention(NaMMAttention):
             lambda: na.window_idx(vid_shape, make_window),
         )
         vid_qkv_win = window_partition(vid_qkv)
+        # The window partition owns a reordered copy; the original projection has no
+        # remaining readers and must not stay resident through attention.
+        vid_qkv = None
 
         vid_qkv_win = rearrange(vid_qkv_win, "l (o h d) -> l o h d", o=3, d=self.head_dim)
         txt_qkv = rearrange(txt_qkv, "l (o h d) -> l o h d", o=3, d=self.head_dim)

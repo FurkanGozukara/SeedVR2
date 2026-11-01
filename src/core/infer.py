@@ -31,6 +31,30 @@ from ..optimization.performance import (
     optimized_channels_to_second
 )
 from ..models.dit_3b import na
+from ..models.video_vae_v3.modules.causal_inflation_lib import single_frame_2d
+
+import functools
+import os
+
+
+def _vae_single_frame_scope(time_dim: int):
+    """Run the wrapped VAE call with the single-frame 2D conv path when every item has one
+    frame (images, previews): about 31-49 % less VAE VRAM, output within 50 dB of the 3D path
+    (WP-SEEDVR2 row 5). SEEDVR2_VAE_2D_SINGLE_FRAME=0 keeps the 3D convs."""
+    def deco(fn):
+        @functools.wraps(fn)
+        def wrapper(self, items, *args, **kwargs):
+            enabled = (
+                os.environ.get("SEEDVR2_VAE_2D_SINGLE_FRAME", "1").strip() != "0"
+                and len(items) > 0
+                and all(torch.is_tensor(t) and t.ndim == 4 and t.shape[time_dim] == 1 for t in items)
+            )
+            if enabled and getattr(self, "debug", None) is not None:
+                self.debug.log("Single-frame VAE: 3D convs run as equivalent 2D convs", category="vae")
+            with single_frame_2d(enabled):
+                return fn(self, items, *args, **kwargs)
+        return wrapper
+    return deco
 
 
 class VideoDiffusionInfer():
@@ -114,6 +138,7 @@ class VideoDiffusionInfer():
     # -------------------------------- Helper ------------------------------- #
 
     @torch.no_grad()
+    @_vae_single_frame_scope(time_dim=1)  # samples: c t h w
     def vae_encode(self, samples: List[Tensor]) -> List[Tensor]:
         """VAE encode with configured dtype - converts samples to latents with optional tiling"""
         use_sample = self.config.vae.get("use_sample", True)
@@ -156,8 +181,12 @@ class VideoDiffusionInfer():
                 # Use autocast if VAE dtype differs from input dtype
                 # Skip autocast on MPS (only supports bf16, unified memory = no benefit)
                 # Instead, explicitly convert input to model dtype
+                # Fused VAE path: same explicit conversion (its fp16 kernels need fp16 input);
+                # the latent goes back to the input dtype below
+                fused_path = getattr(self.vae, 'fused_path', False)
+                input_dtype = sample.dtype
                 if vae_dtype != sample.dtype:
-                    if device.type == 'mps':
+                    if device.type == 'mps' or fused_path:
                         # MPS: explicit dtype conversion instead of autocast
                         sample = sample.to(vae_dtype)
                         if use_sample:
@@ -183,6 +212,9 @@ class VideoDiffusionInfer():
                         latent = self.vae.encode(sample, tiled=self.encode_tiled, tile_size=self.encode_tile_size,
                                             tile_overlap=self.encode_tile_overlap).posterior.mode().squeeze(2)
 
+                if fused_path and latent.dtype != input_dtype:
+                    latent = latent.to(input_dtype)
+
                 latent = latent.unsqueeze(2) if latent.ndim == 4 else latent
                 latent = optimized_channels_to_last(latent)
                 latent = (latent - shift) * scale
@@ -200,6 +232,7 @@ class VideoDiffusionInfer():
     
 
     @torch.no_grad()
+    @_vae_single_frame_scope(time_dim=0)  # latents: t h w c
     def vae_decode(self, latents: List[Tensor]) -> List[Tensor]:
         """VAE decode with configured dtype - converts latents to samples with optional tiling"""
         samples = []
@@ -242,8 +275,11 @@ class VideoDiffusionInfer():
 
                 # Use autocast if VAE dtype differs from latent dtype
                 # Skip autocast on MPS (only supports bf16, unified memory = no benefit)
+                # Fused VAE path: same explicit conversion (its fp16 kernels need fp16 input)
+                fused_path = getattr(self.vae, 'fused_path', False)
+                input_dtype = latent.dtype
                 if vae_dtype != latent.dtype:
-                    if device.type == 'mps':
+                    if device.type == 'mps' or fused_path:
                         # MPS: explicit dtype conversion instead of autocast
                         latent = latent.to(vae_dtype)
                         sample = self.vae.decode(
@@ -264,6 +300,9 @@ class VideoDiffusionInfer():
                         tiled=self.decode_tiled, tile_size=self.decode_tile_size,
                         tile_overlap=self.decode_tile_overlap
                     ).sample
+
+                if fused_path and sample.dtype != input_dtype:
+                    sample = sample.to(input_dtype)
 
                 if hasattr(self.vae, "postprocess"):
                     sample = self.vae.postprocess(sample)

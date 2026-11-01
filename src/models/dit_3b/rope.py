@@ -20,6 +20,7 @@ from rotary_embedding_torch import RotaryEmbedding, apply_rotary_emb
 from torch import nn
 
 from ...common.cache import Cache
+from ...optimization.dit_memory import rope_apply
 
 
 class RotaryEmbeddingBase(nn.Module):
@@ -113,12 +114,9 @@ class NaMMRotaryEmbedding3d(MMRotaryEmbeddingBase):
             vid_freqs = vid_freqs.to(target_device)
         if txt_freqs.device != target_device:
             txt_freqs = txt_freqs.to(target_device)
-        vid_q = rearrange(vid_q, "L h d -> h L d")
-        vid_k = rearrange(vid_k, "L h d -> h L d")
-        vid_q = apply_rotary_emb(vid_freqs, vid_q.float()).to(vid_q.dtype)
-        vid_k = apply_rotary_emb(vid_freqs, vid_k.float()).to(vid_k.dtype)
-        vid_q = rearrange(vid_q, "h L d -> L h d")
-        vid_k = rearrange(vid_k, "h L d -> L h d")
+        # Same arithmetic as apply_rotary_emb(vid_freqs, vid_q.float()) over "h L d", in token chunks
+        vid_q = rope_apply(apply_rotary_emb, vid_freqs, vid_q)
+        vid_k = rope_apply(apply_rotary_emb, vid_freqs, vid_k)
 
         txt_q = rearrange(txt_q, "L h d -> h L d")
         txt_k = rearrange(txt_k, "L h d -> h L d")

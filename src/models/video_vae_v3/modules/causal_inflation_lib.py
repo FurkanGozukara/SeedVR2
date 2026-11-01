@@ -13,6 +13,7 @@
 # // limitations under the License.
 
 import math
+import os
 from contextlib import contextmanager
 from typing import List, Optional, Union
 import torch
@@ -28,6 +29,8 @@ from .types import MemoryState, _inflation_mode_t, _memory_device_t
 from ....common.half_precision_fixes import safe_pad_operation
 from ....optimization.memory_manager import retry_on_oom
 from ....optimization.compatibility import NVIDIA_CONV3D_MEMORY_BUG_WORKAROUND
+from ....optimization.vae_fusion import fp16_accum_conv3d, match_channels_last_3d
+from ....optimization.vae_fusion import _SUSPENDED as _FUSION_SUSPENDED
 
 # Single GPU inference - no distributed processing needed
 #print("Warning: Using single GPU inference mode - distributed features disabled in causal_inflation_lib")
@@ -47,6 +50,22 @@ def get_next_sequence_parallel_rank():
 
 def get_prev_sequence_parallel_rank():
     return 0
+
+
+_SINGLE_FRAME_2D = [False]
+
+
+@contextmanager
+def single_frame_2d(enabled: bool):
+    """Within this scope, causal 3D convs that see exactly one frame run as the equivalent
+    2D conv (YellowRoseCx 97637c5865). Only entered for single-frame (image) VAE calls."""
+    previous = _SINGLE_FRAME_2D[0], _FUSION_SUSPENDED[0]
+    _SINGLE_FRAME_2D[0] = bool(enabled)
+    _FUSION_SUSPENDED[0] = bool(enabled)
+    try:
+        yield
+    finally:
+        _SINGLE_FRAME_2D[0], _FUSION_SUSPENDED[0] = previous
 
 
 @contextmanager
@@ -74,6 +93,7 @@ class InflatedCausalConv3d(Conv3d):
         self.memory_device = memory_device
         self.padding = (0, *self.padding[1:])  # Remove temporal pad to keep causal.
         self.memory_limit = float("inf")
+        self.fused_path = False  # Set by enable_vae_fused_path (SEEDVR2_FUSED_VAE)
 
     def set_memory_limit(self, value: float):
         self.memory_limit = value
@@ -91,6 +111,11 @@ class InflatedCausalConv3d(Conv3d):
         Workaround: Call torch.cudnn_convolution directly to bypass buggy layer.
         Status is logged at startup in compatibility.py.
         """
+        # Fused VAE path: fp16-accumulate kernel, NDHWC in and out
+        if (self.fused_path and not _FUSION_SUSPENDED[0]
+                and input.dtype == torch.float16 and weight.dtype == torch.float16):
+            return fp16_accum_conv3d(input, weight, bias, self.stride, self.padding)
+
         if (NVIDIA_CONV3D_MEMORY_BUG_WORKAROUND and 
             weight.dtype in (torch.float16, torch.bfloat16) and 
             hasattr(torch.backends.cudnn, 'is_available') and
@@ -216,6 +241,18 @@ class InflatedCausalConv3d(Conv3d):
         memory_state: MemoryState = MemoryState.UNSET
     ) -> Tensor:
         assert memory_state != MemoryState.UNSET
+        if (
+            _SINGLE_FRAME_2D[0]
+            and torch.is_tensor(input)
+            and input.ndim == 5
+            and input.shape[2] == 1
+            and self.kernel_size[0] > 1
+            and self.dilation[0] == 1
+            and self.temporal_padding * 2 == self.kernel_size[0] - 1
+            and not (memory_state == MemoryState.ACTIVE and self.memory is not None)
+            and get_sequence_parallel_group() is None
+        ):
+            return self._single_frame_forward(input, memory_state)
         if memory_state != MemoryState.ACTIVE:
             self.memory = None
         if (
@@ -225,6 +262,31 @@ class InflatedCausalConv3d(Conv3d):
         ):
             return self.basic_forward(input, memory_state)
         return self.slicing_forward(input, memory_state)
+
+    def _single_frame_forward(self, input: Tensor, memory_state: MemoryState) -> Tensor:
+        """
+        One input frame: the causal head padding replicates it 2*temporal_padding times,
+        so every temporal tap sees the same frame and the conv over kt frames equals a 2D
+        conv with the taps summed: out = conv2d(frame, sum_t W[:, :, t]). Saves kt-1 of
+        every kt multiply-adds and never builds the kt-times replicated input.
+        """
+        if memory_state != MemoryState.ACTIVE:
+            self.memory = None
+        frame = input[:, :, 0]
+        keep = self.kernel_size[0] - self.stride[0]  # frames the next slice would read
+        if (
+            memory_state != MemoryState.DISABLED
+            and not self.training
+            and self.memory_device is not None
+            and keep > 0
+        ):
+            self.memory = input.expand(-1, -1, keep, -1, -1).detach().contiguous()
+            if self.memory_device == "cpu":
+                self.memory = self.memory.to("cpu")
+        weight = self.weight.float().sum(dim=2).to(self.weight.dtype)
+        out = F.conv2d(frame, weight, self.bias, stride=self.stride[1:], padding=self.padding[1:],
+                       dilation=self.dilation[1:], groups=self.groups)
+        return out.unsqueeze(2)
 
     def basic_forward(self, input: Tensor, memory_state: MemoryState = MemoryState.UNSET):
         mem_size = self.stride[0] - self.kernel_size[0]
@@ -261,6 +323,9 @@ class InflatedCausalConv3d(Conv3d):
         cache = cache_send_recv(
             input, cache_size=cache_size, memory=self.memory, times=self.temporal_padding * 2
         )
+        # Fused VAE path: keep the carried-over frames in NDHWC like the input
+        if self.fused_path and cache is not None:
+            cache = match_channels_last_3d(cache, input[0])
 
         # Single GPU inference - simplified memory management
         if (
@@ -273,7 +338,12 @@ class InflatedCausalConv3d(Conv3d):
                 input[0] = torch.cat([cache, input[0]], dim=2)
                 cache = None
             if cache_size <= input[-1].size(2):
-                self.memory = input[-1][:, :, -cache_size:].detach().contiguous()
+                memory = input[-1][:, :, -cache_size:].detach()
+                if self.fused_path and input[-1].is_contiguous(memory_format=torch.channels_last_3d):
+                    # Fused VAE path: keep NDHWC; clone so the whole input is not kept alive
+                    self.memory = memory.clone(memory_format=torch.channels_last_3d)
+                else:
+                    self.memory = memory.contiguous()
                 if self.memory_device == "cpu" and self.memory is not None:
                     self.memory = self.memory.to("cpu")
 
@@ -333,6 +403,14 @@ class InflatedCausalConv3d(Conv3d):
             unexpected_keys,
             error_msgs,
         )
+
+
+# torch.compile of the VAE: the causal conv's shapes follow its memory/slicing state, so
+# dynamo recompiles it many times before giving up (jojje fef7f340c1). The conv stays eager while the
+# rest of the VAE is compiled (measured with compile_vae: image run 155 -> 88 s, output unchanged);
+# SEEDVR2_VAE_CONV_EAGER=0 compiles it too.
+if os.environ.get("SEEDVR2_VAE_CONV_EAGER", "1").strip() != "0":
+    InflatedCausalConv3d.forward = torch.compiler.disable(InflatedCausalConv3d.forward)
 
 
 def init_causal_conv3d(

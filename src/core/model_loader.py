@@ -649,10 +649,46 @@ def _load_model_weights(model: torch.nn.Module, checkpoint_path: str, target_dev
                 state = load_quantized_state_dict(load_path, target_device, debug)
                 if override_dtype is not None:
                     state = _convert_state_dtype(state, override_dtype, model_type, debug)
+        if model_type_lower == "dit" and not using_int8_cache:
+            from src.optimization.w4a8_runtime import (
+                is_w4a8_state_dict, prepare_model_for_w4a8, w4a8_unavailable_reason,
+            )
+
+            if is_w4a8_state_dict(state):
+                w4a8_device = torch.device("cuda", torch.cuda.current_device()) if torch.cuda.is_available() else torch.device("cpu")
+                reason = w4a8_unavailable_reason(w4a8_device)
+                if reason:
+                    raise RuntimeError(
+                        f"W4A8 ConvRot cannot run on this device ({reason}). Use seedvr2_ema_7b_sharp_fp16.safetensors "
+                        "with --int8_convrot instead (the app switches to it automatically).")
+                patched = prepare_model_for_w4a8(model, state)
+                debug.log(f"Prepared {patched} W4A8 ConvRot Linear layers (comfy_kitchen INT8 GEMM)",
+                          category="precision", force=True)
+                if int8_convrot:
+                    debug.log("Checkpoint is already W4A8; INT8 ConvRot conversion skipped",
+                              category="precision", force=True)
+                int8_convrot = False
         model = _load_standard_weights(model, state, used_meta, model_type, model_type_lower, debug)
     
     # Clean up state dict
     del state
+
+    # Optional fused VAE path (SEEDVR2_FUSED_VAE=1): comfy-kitchen fused GroupNorm+SiLU and
+    # fp16-accumulate conv3d kernels, NDHWC between them (port of sh202603 d3254c722b).
+    from src.optimization.vae_fusion import fused_vae_requested
+    if model_type_lower == "vae" and fused_vae_requested():
+        from src.optimization.vae_fusion import enable_vae_fused_path, get_vae_fused_path_unsupported_reason
+        # the VAE may be materialized on its CPU offload device first; it runs on CUDA
+        reason = get_vae_fused_path_unsupported_reason(torch.device("cuda") if torch.cuda.is_available() else target_device)
+        if reason is None and next(model.parameters()).dtype != torch.float16:
+            reason = "needs fp16 VAE weights"
+        if reason is None:
+            convs, owners = enable_vae_fused_path(model)
+            debug.log(f"Fused VAE path: {convs} fp16-accumulate convs, {owners} fused GroupNorm+SiLU owners",
+                      category="vae", force=True)
+        else:
+            debug.log(f"Fused VAE path unavailable ({reason}); standard VAE path",
+                      level="WARNING", category="vae", force=True)
     
     # Initialize meta buffers if needed
     if used_meta:

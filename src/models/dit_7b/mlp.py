@@ -17,6 +17,8 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from ...optimization.dit_memory import MLP_CHUNK_TOKENS, chunked_rows, linear_fn, should_chunk
+
 
 def get_mlp(mlp_type: Optional[str] = "normal"):
     if mlp_type == "normal":
@@ -37,6 +39,10 @@ class MLP(nn.Module):
         self.proj_out = nn.Linear(dim * expand_ratio, dim)
 
     def forward(self, x: torch.FloatTensor) -> torch.FloatTensor:
+        if should_chunk(x, MLP_CHUNK_TOKENS):
+            # Token chunks: the dim*expand_ratio hidden activation exists for one chunk at a time
+            proj_in, proj_out = linear_fn(self.proj_in, x), linear_fn(self.proj_out, x)
+            return chunked_rows(lambda t: proj_out(self.act(proj_in(t))), x, MLP_CHUNK_TOKENS)
         x = self.proj_in(x)
         x = self.act(x)
         x = self.proj_out(x)
@@ -58,5 +64,9 @@ class SwiGLUMLP(nn.Module):
         self.proj_in = nn.Linear(dim, hidden_dim, bias=False)
 
     def forward(self, x: torch.FloatTensor) -> torch.FloatTensor:
+        if should_chunk(x, MLP_CHUNK_TOKENS):
+            # Token chunks: gate, up and hidden activations exist for one chunk at a time
+            gate, up, down = (linear_fn(m, x) for m in (self.proj_in_gate, self.proj_in, self.proj_out))
+            return chunked_rows(lambda t: down(F.silu(gate(t)) * up(t)), x, MLP_CHUNK_TOKENS)
         x = self.proj_out(F.silu(self.proj_in_gate(x)) * self.proj_in(x))
         return x

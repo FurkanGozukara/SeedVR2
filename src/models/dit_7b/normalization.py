@@ -18,6 +18,7 @@ from torch import nn
 import torch
 import torch.nn.functional as F
 import numbers
+import os
 from torch.nn.parameter import Parameter
 from torch.nn import init
 
@@ -56,6 +57,10 @@ class CustomLayerNorm(nn.Module):
             input, self.normalized_shape, self.weight, self.bias, self.eps)
 
 
+# SEEDVR2_FP16_SAFE_NORM=0 restores the plain fp16 reduction (A/B testing only)
+_FP16_SAFE_NORM = os.environ.get("SEEDVR2_FP16_SAFE_NORM", "1").strip() != "0"
+
+
 class CustomRMSNorm(nn.Module):
     """
     Custom RMSNorm implementation to replace Apex FusedRMSNorm
@@ -78,12 +83,18 @@ class CustomRMSNorm(nn.Module):
         # RMS normalization: x / sqrt(mean(x^2) + eps) * weight
         dims = tuple(range(-len(self.normalized_shape), 0))
         
-        # Calculate RMS: sqrt(mean(x^2))
-        variance = input.pow(2).mean(dim=dims, keepdim=True)
-        rms = torch.sqrt(variance + self.eps)
-        
-        # Normalize
-        normalized = input / rms
+        if input.dtype == torch.float16 and _FP16_SAFE_NORM:
+            # fp16 compute path (GPUs without bf16 GEMM): x^2 overflows fp16 above |x| = 256 and
+            # the whole token would normalize to 0 (or NaN). Reduce and divide in fp32.
+            x32 = input.float()
+            normalized = (x32 * torch.rsqrt(x32.pow(2).mean(dim=dims, keepdim=True) + self.eps)).to(input.dtype)
+        else:
+            # Calculate RMS: sqrt(mean(x^2))
+            variance = input.pow(2).mean(dim=dims, keepdim=True)
+            rms = torch.sqrt(variance + self.eps)
+
+            # Normalize
+            normalized = input / rms
         
         if self.elementwise_affine:
             # Convert FP8 weight to match input dtype for arithmetic operations
