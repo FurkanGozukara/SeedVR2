@@ -222,6 +222,26 @@ def _iter_uint8_frames(
         for frame in batch_u8.numpy():
             yield frame
 
+# SECourses app (V10.5+): the FFmpeg video arguments the app checked for this run, a JSON list from -c:v on
+# (NVIDIA NVENC). When present they replace codec / pixel format / preset / CRF / tuning of FFMPEGVideoWriter.
+APP_VIDEO_ARGS_ENV = "SECOURSES_FFMPEG_VIDEO_ARGS"
+
+
+def _app_video_args():
+    import json as _json
+
+    raw = str(os.environ.get(APP_VIDEO_ARGS_ENV, "") or "").strip()
+    if not raw:
+        return None
+    try:
+        value = _json.loads(raw)
+    except Exception:
+        return None
+    if isinstance(value, list) and value and all(isinstance(v, str) for v in value):
+        return value
+    return None
+
+
 class FFMPEGVideoWriter:
     """
     Video writer using ffmpeg subprocess for encoding with 10-bit support.
@@ -291,19 +311,26 @@ class FFMPEGVideoWriter:
             str(fps),
             '-i',
             '-',
-            '-c:v',
-            codec,
-            '-pix_fmt',
-            pix_fmt,
-            '-preset',
-            preset,
-            '-crf',
-            crf,
         ]
-        if codec == "libx265" and tune != "none":
-            cmd.extend(["-tune", tune])
-        if codec in {"libsvtav1", "libaom-av1"}:
-            cmd.extend(["-svtav1-params", f"film-grain={film_grain}:film-grain-denoise={1 if denoise else 0}"])
+        app_args = _app_video_args()
+        if app_args:
+            # SECourses app (V10.5+): encoder arguments it checked for this run (NVIDIA NVENC).
+            cmd.extend(app_args)
+        else:
+            cmd.extend([
+                '-c:v',
+                codec,
+                '-pix_fmt',
+                pix_fmt,
+                '-preset',
+                preset,
+                '-crf',
+                crf,
+            ])
+            if codec == "libx265" and tune != "none":
+                cmd.extend(["-tune", tune])
+            if codec in {"libsvtav1", "libaom-av1"}:
+                cmd.extend(["-svtav1-params", f"film-grain={film_grain}:film-grain-denoise={1 if denoise else 0}"])
         cmd.append(path)
 
         self.proc = subprocess.Popen(
