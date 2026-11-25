@@ -262,6 +262,7 @@ class VideoDiffusionInfer():
 
             self.debug.log(f"Latents shape: {latents[0].shape}", category="info", indent_level=1)
 
+            self.vae.adaptive_vae_decode = bool(getattr(self, "adaptive_vae_decode", False))
             for i, latent in enumerate(latents):
                 latent = latent / scale + shift
                 latent = optimized_channels_to_second(latent)

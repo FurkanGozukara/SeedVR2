@@ -13,6 +13,7 @@
 from contextlib import nullcontext
 from typing import Literal, Optional, Tuple, Union
 import diffusers
+import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -1317,8 +1318,26 @@ class VideoAutoencoderKL(diffusers.AutoencoderKL):
 
     def slicing_decode(self, z: torch.Tensor) -> torch.Tensor:
         sp_size = get_sequence_parallel_world_size()
-        if self.use_slicing and (z.shape[2] - 1) > self.slicing_latent_min_size * sp_size:
-            z_slices = z[:, :, 1:].split(split_size=self.slicing_latent_min_size * sp_size, dim=2)
+        if not self.use_slicing:
+            return self._decode(z)
+        split_size = self.slicing_latent_min_size * sp_size
+        adaptive = getattr(self, "adaptive_vae_decode", False) or os.getenv("SEEDVR2_ADAPTIVE_VAE_DECODE") == "1"
+        if sp_size == 1 and z.is_cuda and z.shape[2] > split_size + 1 and adaptive:
+            free, _ = torch.cuda.mem_get_info(z.device)
+            free += torch.cuda.memory_reserved(z.device) - torch.cuda.memory_allocated(z.device)
+            cap = float(os.getenv("SECOURSES_VRAM_LIMIT_GB") or 0)
+            if cap > 0:
+                free = min(free, max(0, int(cap * 1024 ** 3) - torch.cuda.memory_allocated(z.device)))
+            output_pixels = z.shape[0] * z.shape[-2] * z.shape[-1] * self.spatial_downsample_factor ** 2
+            # Reserve room for the causal head, retained output and the decoder's working set.
+            bytes_per_latent = 5300 * output_pixels * max(1.0, z.element_size() / 2)
+            fit = int((free * 0.65 - 1024 ** 3) / bytes_per_latent) - 1
+            split_size = max(split_size, min(4, fit, z.shape[2] - 1))
+            if self.debug and split_size != getattr(self, "_last_vae_slice", None):
+                self.debug.log(f"Adaptive VAE time slice: {split_size} latent frames", category="vae")
+                self._last_vae_slice = split_size
+        if (z.shape[2] - 1) > split_size:
+            z_slices = z[:, :, 1:].split(split_size=split_size, dim=2)
             decoded_slices = [
                 self._decode(
                     torch.cat((z[:, :, :1], z_slices[0]), dim=2),

@@ -1648,6 +1648,9 @@ def _create_processing_runtime(
         int8_convrot=bool(getattr(args, "int8_convrot", False)) and not str(args.dit_model or "").lower().endswith(".gguf")
     )
 
+    runner.adaptive_vae_decode = bool(getattr(args, "adaptive_vae_decode", False))
+    if runner.adaptive_vae_decode:
+        debug.log("Adaptive VAE temporal slicing enabled", category="vae")
     ctx['cache_context'] = cache_context
     if allow_model_cache and runner_cache is not None:
         runner_cache['runner'] = runner
@@ -2511,6 +2514,8 @@ Examples:
                         help="VAE encode tile overlap in pixels (default: 128). Reduces visible seams between tiles. Only used if --vae_encode_tiled is set")
     vae_group.add_argument("--vae_decode_tiled", action="store_true",
                         help="Enable VAE decode tiling to reduce VRAM during decoding")
+    vae_group.add_argument("--adaptive_vae_decode", action="store_true",
+                        help="Choose VAE temporal slice size from available GPU memory")
     vae_group.add_argument("--vae_decode_tile_size", type=int, default=1024,
                         help="VAE decode tile size in pixels (default: 1024). Applied to both height and width. Only used if --vae_decode_tiled is set")
     vae_group.add_argument("--vae_decode_tile_overlap", type=int, default=128,
